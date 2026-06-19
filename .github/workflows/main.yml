@@ -85,6 +85,7 @@ jobs:
           build-key: ${{ env.BUILD_KEY }}
           node-version: '22.22.2'
           wails-version: 'v2.11.0'
+          nsis: 'true'
 
       - name: Update release for channel
         if: steps.channel.outputs.channel != 'release'
