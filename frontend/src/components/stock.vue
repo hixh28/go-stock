@@ -307,19 +307,6 @@ const allTableColumns = [
       ])
     }
   },
-  // {
-  //   title: '分时', key: 'sparkline', width: 100,
-  //   render(row) {
-  //     // idSuffix 避免与分组卡片中的 sparkLine 元素 id 冲突
-  //     return h(StockSparkLine, {
-  //       idSuffix: '_alltable',
-  //       stockCode: row['股票代码'],
-  //       stockName: row['股票名称'],
-  //       lastPrice: Number(row['当前价格']),
-  //       openPrice: Number(row['昨日收盘价'])
-  //     })
-  //   }
-  // },
   {
     title: '时间', key: '日期', width: 140,
     sorter: (a, b) => String(a['日期'] + ' ' + a['时间']).localeCompare(String(b['日期'] + ' ' + b['时间'])),
