@@ -1119,7 +1119,7 @@ type TdxStockBasic struct {
 
 // GetAllStockList 通过通达信标准行情接口拉取沪深京全市场股票代码+名称列表。
 // 即时性高（新股上市当天即可见），不会被封 IP。仅覆盖 A 股，不含港美股。
-// 返回结果按市场顺序：深圳 -> 上海 -> 北京，已用 types.IsStock 过滤掉指数/基金/债券等非股票标的。
+// 返回结果按市场顺序：深圳 -> 上海 -> 北京，已用 types.IsStock 过滤掉指数/债券等非股票标的，场内 ETF 由 IsOnExchangeFund 放行。
 func (t *TdxKLineApi) GetAllStockList() *[]TdxStockBasic {
 	result := &[]TdxStockBasic{}
 	if err := t.ensureClient(); err != nil {
@@ -1145,7 +1145,7 @@ func (t *TdxKLineApi) GetAllStockList() *[]TdxStockBasic {
 	return result
 }
 
-// fetchStockListByMarket 拉取单个市场的全部证券列表，过滤出股票后追加到 result
+// fetchStockListByMarket 拉取单个市场的全部证券列表，过滤出股票与场内 ETF 后追加到 result
 func (t *TdxKLineApi) fetchStockListByMarket(market types.Market, result *[]TdxStockBasic) error {
 	t.mu.Lock()
 	items, err := t.client.StockAll(market.Uint8())
@@ -1156,9 +1156,9 @@ func (t *TdxKLineApi) fetchStockListByMarket(market types.Market, result *[]TdxS
 
 	marketStr := market.String()
 	for _, item := range items {
-		// 用 types.IsStock 过滤指数/基金/债券等非股票标的（要求 代码.SH/SZ/BJ 格式）
+		// 用 types.IsStock 过滤指数/债券等非股票标的；场内 ETF 另由 IsOnExchangeFund 放行（要求 代码.SH/SZ/BJ 格式）
 		symbol := fmt.Sprintf("%s.%s", item.Code, marketStr)
-		if !types.IsStock(symbol) {
+		if !types.IsStock(symbol) && !IsOnExchangeFund(item.Code) {
 			continue
 		}
 		*result = append(*result, TdxStockBasic{

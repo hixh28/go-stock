@@ -65,8 +65,15 @@ const hoverRawRow = ref(null)
 /** 无十字线时展示：当前数据中时间最新的一根 K 线 */
 const defaultLatestRawRow = ref(null)
 const activeKlt = ref('101')
-// 复权类型：qfq=前复权(默认)、hfq=后复权、none=不复权；仅日K及更长周期有效
-const activeAdjust = ref(DEFAULT_ADJUST)
+// 场内 ETF 识别：沪市前缀 50/51/52/53/56/58，深市前缀 15/16；ETF 默认不复权且隐藏复权切换
+const isEtfCode = computed(() => {
+  const digits = String(props.code || '').replace(/[^\d]/g, '')
+  if (digits.length < 6) return false
+  const prefix = digits.substring(0, 2)
+  return ['15', '16', '50', '51', '52', '53', '56', '58'].includes(prefix)
+})
+// 复权类型：qfq=前复权(默认)、hfq=后复权、none=不复权；仅日K及更长周期有效；场内 ETF 默认 none
+const activeAdjust = ref(isEtfCode.value ? 'none' : DEFAULT_ADJUST)
 // 实际传给后端的复权标识：分时周期传空串（走各数据源默认行为），日K类周期传 activeAdjust
 const adjustFlagForRequest = computed(() => {
   return DAILY_LIKE_KLT.has(activeKlt.value) ? activeAdjust.value : ''
@@ -4009,6 +4016,14 @@ watch(activeAdjust, () => {
   loadData()
 })
 
+// 代码切换时（调用方未用 :key 重建组件的防御性处理）按 ETF 规则重置复权默认值
+watch(() => props.code, () => {
+  const next = isEtfCode.value ? 'none' : DEFAULT_ADJUST
+  if (activeAdjust.value !== next) {
+    activeAdjust.value = next
+  }
+})
+
 watch(
   () => props.darkTheme,
   (d) => {
@@ -4399,7 +4414,7 @@ watch(showLongPosition, (newVal) => {
             {{ it.label }}
           </NButton>
           <span style="width: 12px" />
-          <template v-if="DAILY_LIKE_KLT.has(activeKlt)">
+          <template v-if="DAILY_LIKE_KLT.has(activeKlt) && !isEtfCode.value">
             <NText depth="3" style="font-size: 12px; margin-right: 2px">复权</NText>
             <NButton
               v-for="opt in ADJUST_OPTIONS"
