@@ -5,14 +5,18 @@ import (
 	"embed"
 	"encoding/json"
 	"fmt"
+	assistantweb "go-stock/ai-assistant-web"
 	"go-stock/backend/data"
 	"go-stock/backend/db"
 	log "go-stock/backend/logger"
+	"go-stock/backend/machineid"
 	"go-stock/backend/models"
 	"os"
 	"runtime/debug"
 	"strings"
+	"time"
 
+	"github.com/duke-git/lancet/v2/convertor"
 	"github.com/duke-git/lancet/v2/slice"
 	"github.com/wailsapp/wails/v2"
 	"github.com/wailsapp/wails/v2/pkg/logger"
@@ -50,6 +54,9 @@ var stocksBinHK []byte
 //go:embed build/stock_base_info_us.json
 var stocksBinUS []byte
 
+//go:embed docs/go-stock使用手册.md
+var userManual []byte
+
 //go:generate cp -R ./data ./build/bin
 
 var Version string
@@ -66,6 +73,9 @@ func main() {
 	}()
 
 	checkDir("data")
+	machineid.Init(BuildKey)
+	data.SponsorDecryptKeyHex = BuildKey
+	data.SetAppIcon(icon)
 	db.Init("")
 	data.InitAnalyzeSentiment()
 	go AutoMigrate()
@@ -78,6 +88,11 @@ func main() {
 	log.SugaredLogger.Info("starting...")
 	log.SugaredLogger.Infof("version: %s  commit: %s", Version, VersionCommit)
 	//log.SugaredLogger.Infof("build key: %s", BuildKey)
+
+	// 程序启动时预缓存东财 Cookie
+	//go func() {
+	//	cacheCookies("https://push2his.eastmoney.com/api/qt/stock/kline/get")
+	//}()
 
 	// Create an instance of the app structure
 	app := NewApp()
@@ -115,15 +130,13 @@ func main() {
 	//})
 	log.SugaredLogger.Info("version: " + Version)
 	log.SugaredLogger.Info("commit: " + VersionCommit)
-	// Create application with options
-	//var width, height int
-	//var err error
-	//
-	width, _, minWidth, minHeight, err := getScreenResolution()
+	// 根据屏幕分辨率自适应窗口尺寸
+	width, height, _, _, err := getScreenResolution()
 	if err != nil {
 		log.SugaredLogger.Error("get screen resolution error")
-		width = 1456
-		//height = 768
+		// 获取失败时给一个合理的默认值
+		width = 1412
+		height = 834
 	}
 
 	darkTheme := data.GetSettingConfig().DarkTheme
@@ -134,27 +147,50 @@ func main() {
 
 	//frameless := getFrameless()
 
+	// 计算默认窗口大小：优先使用上次保存的用户尺寸，否则自适应
+	config := data.GetSettingConfig()
+
+	appWidth := config.WindowWidth
+	appHeight := config.WindowHeight
+
+	// 若用户尚未调整过窗口或记录为 0，则按屏幕比例给一个合适默认值
+	if appWidth <= 0 || appHeight <= 0 {
+		appWidth = width * 5 / 10
+		appHeight = height * 5 / 10
+	}
+	log.SugaredLogger.Info("screen resolution: " + convertor.ToString(width) + "x" + convertor.ToString(height))
+	log.SugaredLogger.Info("window size: " + convertor.ToString(appWidth) + "x" + convertor.ToString(appHeight))
+
+	// 作为 go-stock 子组件启动独立 Web 服务
+	// 端口默认由 AI_ASSISTANT_WEB_ADDR 决定。
+	go func() {
+		if err := assistantweb.Start(); err != nil {
+			log.SugaredLogger.Errorf("ai-assistant-web start error: %v", err)
+		}
+	}()
+
 	// Create application with options
 	err = wails.Run(&options.App{
-		Title:     "go-stock：AI赋能股票分析✨ " + OFFICIAL_STATEMENT,
-		Width:     width * 4 / 5,
-		Height:    920,
-		MinWidth:  minWidth,
-		MinHeight: minHeight,
+		Title: "go-stock：AI赋能股票分析✨ " + OFFICIAL_STATEMENT,
+		// 默认窗口大小：自适应但保留明显边距
+		Width:  appWidth,
+		Height: appHeight,
+		//MinWidth:  minWidth,
+		//MinHeight: minHeight,
+		// 限制最大尺寸不超过屏幕
 		//MaxWidth:                 width,
 		//MaxHeight:                height,
 		DisableResize:            false,
 		Fullscreen:               false,
 		Frameless:                false,
 		StartHidden:              false,
-		HideWindowOnClose:        false,
 		EnableDefaultContextMenu: true,
 		BackgroundColour:         backgroundColour,
 		Assets:                   assets,
 		Menu:                     AppMenu,
-		Logger:                   nil,
+		Logger:                   logger.NewFileLogger("./logs/wails.log"),
 		LogLevel:                 logger.DEBUG,
-		LogLevelProduction:       logger.ERROR,
+		LogLevelProduction:       logger.INFO,
 		OnStartup:                app.startup,
 		OnDomReady:               app.domReady,
 		OnBeforeClose:            app.beforeClose,
@@ -189,7 +225,7 @@ func main() {
 			WindowIsTranslucent:  true,
 			About: &mac.AboutInfo{
 				Title:   "go-stock",
-				Message: "",
+				Message: "go-stock：AI赋能股票分析✨ ",
 				Icon:    icon,
 			},
 		},
@@ -199,6 +235,16 @@ func main() {
 		log.SugaredLogger.Fatal(err)
 	}
 
+}
+
+func cacheCookies(url string) {
+	log.SugaredLogger.Info("预缓存东财 Cookie...")
+	_, err := data.FetchEastMoneyCookiesViaChromedp("", 3*time.Minute, url)
+	if err != nil {
+		log.SugaredLogger.Warnf("预缓存东财 Cookie 失败：%v", err)
+	} else {
+		log.SugaredLogger.Info("东财 Cookie 预缓存完成")
+	}
 }
 
 func updateMultipleModel() {
@@ -231,6 +277,7 @@ func AutoMigrate() {
 	db.Dao.AutoMigrate(&models.StockInfoHK{})
 	db.Dao.AutoMigrate(&models.StockInfoUS{})
 	db.Dao.AutoMigrate(&data.FollowedFund{})
+	db.Dao.AutoMigrate(&data.FollowedStock{})
 	db.Dao.AutoMigrate(&data.FundBasic{})
 	db.Dao.AutoMigrate(&models.PromptTemplate{})
 	db.Dao.AutoMigrate(&data.Group{})
@@ -243,8 +290,48 @@ func AutoMigrate() {
 	db.Dao.AutoMigrate(&models.BKDict{})
 	db.Dao.AutoMigrate(&models.WordAnalyze{})
 	db.Dao.AutoMigrate(&models.SentimentResultAnalyze{})
+	db.Dao.AutoMigrate(&models.AiRecommendStocks{})
+	db.Dao.AutoMigrate(&models.AllStockInfo{})
+	db.Dao.AutoMigrate(&models.CronTask{})
+	db.Dao.AutoMigrate(&models.AiAssistantSession{})
+	db.Dao.AutoMigrate(&models.GlobalStockIndex{})
+	db.Dao.AutoMigrate(&data.TradingRecord{})
+	db.Dao.AutoMigrate(&models.MCPServer{})
+	db.Dao.AutoMigrate(&models.MCPServerTool{})
+	db.Dao.AutoMigrate(&models.Skill{})
+	db.Dao.AutoMigrate(&models.CustomStrategy{})
+	db.Dao.AutoMigrate(&models.BKFundFlow{})
+	db.Dao.AutoMigrate(&models.ConceptFundFlow{})
 
-	updateMultipleModel()
+	//updateMultipleModel()
+
+	// 初始化 global_stock_index_cache 定时任务
+	initGlobalStockIndexCacheTask()
+}
+
+// initGlobalStockIndexCacheTask 检查并创建 global_stock_index_cache 定时任务
+func initGlobalStockIndexCacheTask() {
+	var count int64
+	db.Dao.Model(&models.CronTask{}).Where("task_type = ?", "global_stock_index_cache").Count(&count)
+	if count == 0 {
+		task := &models.CronTask{
+			Name:        "全球指数缓存",
+			CronExpr:    "0 0/5 * * * *", // 每分钟执行一次
+			TaskType:    "global_stock_index_cache",
+			Target:      "",
+			Params:      `{"crawlTimeOut": 30}`,
+			Enable:      true,
+			Status:      "active",
+			Description: "自动缓存全球股票指数数据",
+		}
+		err := db.Dao.Create(task).Error
+		if err != nil {
+			log.SugaredLogger.Errorf("创建 global_stock_index_cache 定时任务失败：%v", err)
+		} else {
+			log.SugaredLogger.Info("创建 global_stock_index_cache 定时任务成功")
+		}
+	}
+
 }
 
 func initStockDataUS(ctx context.Context) {

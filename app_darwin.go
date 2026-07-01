@@ -6,27 +6,36 @@ package main
 import (
 	"context"
 	"fmt"
-	"github.com/duke-git/lancet/v2/convertor"
-	"github.com/duke-git/lancet/v2/strutil"
-	"github.com/gen2brain/beeep"
-	"github.com/wailsapp/wails/v2/pkg/options"
-	"github.com/wailsapp/wails/v2/pkg/runtime"
 	"go-stock/backend/data"
 	"go-stock/backend/db"
 	"go-stock/backend/logger"
 	"log"
 	"time"
+
+	"github.com/duke-git/lancet/v2/convertor"
+	"github.com/duke-git/lancet/v2/strutil"
+	"github.com/gen2brain/beeep"
+	"github.com/wailsapp/wails/v2/pkg/options"
+	"github.com/wailsapp/wails/v2/pkg/runtime"
 )
 
 // startup 在应用程序启动时调用
 func (a *App) startup(ctx context.Context) {
 	defer PanicHandler()
+
+	data.ConfigureFromSettings(data.GetSettingConfig())
+
 	runtime.EventsOn(ctx, "frontendError", func(optionalData ...interface{}) {
 		logger.SugaredLogger.Errorf("Frontend error: %v\n", optionalData)
 	})
 	logger.SugaredLogger.Infof("Version:%s", Version)
 	// Perform your setup here
 	a.ctx = ctx
+
+	// 应用启动时自动创建已启用的定时任务
+	a.InitCronTasks()
+
+	preCacheTradingDays()
 
 	// 监听设置更新事件
 	runtime.EventsOn(ctx, "updateSettings", func(optionalData ...interface{}) {
@@ -46,7 +55,7 @@ func (a *App) startup(ctx context.Context) {
 		//	return
 		//}
 
-		logger.SugaredLogger.Infof("updateSettings config:%+v", config)
+		//logger.SugaredLogger.Infof("updateSettings config:%+v", config)
 		if config.DarkTheme {
 			runtime.WindowSetBackgroundColour(ctx, 27, 38, 54, 1)
 			runtime.WindowSetDarkTheme(ctx)
@@ -100,6 +109,19 @@ func OnSecondInstanceLaunch(secondInstanceData options.SecondInstanceData) {
 }
 
 func MonitorStockPrices(a *App) {
+	// 检查是否至少有一个市场开市
+	isAStockOpen := isTradingTime(time.Now())
+	isHKStockOpen := IsHKTradingTime(time.Now())
+	isUSStockOpen := IsUSTradingTime(time.Now())
+
+	// 如果所有市场都不在交易时间，则提前返回
+	if !isAStockOpen && !isHKStockOpen && !isUSStockOpen {
+		logger.SugaredLogger.Debugf("当前所有市场均未开市，跳过价格监控")
+		return
+	}
+
+	logger.SugaredLogger.Debugf("市场状态 - A股: %v, 港股: %v, 美股: %v", isAStockOpen, isHKStockOpen, isUSStockOpen)
+
 	dest := &[]data.FollowedStock{}
 	db.Dao.Model(&data.FollowedStock{}).Find(dest)
 	total := float64(0)
@@ -162,13 +184,26 @@ func onReady(a *App) {
 func (a *App) beforeClose(ctx context.Context) (prevent bool) {
 	defer PanicHandler()
 
+	// 记录当前窗口大小，供下次启动时还原
+	if a.ctx != nil {
+		w, h := runtime.WindowGetSize(ctx)
+		logger.SugaredLogger.Infof(" window size: %dx%d", w, h)
+		if w > 0 && h > 0 {
+			cfg := data.GetSettingConfig()
+			cfg.WindowWidth = w
+			cfg.WindowHeight = h
+			data.UpdateConfig(cfg)
+			logger.SugaredLogger.Infof("save window size: %dx%d", w, h)
+		}
+	}
+
 	// 在 macOS 上使用 MessageDialog 显示确认窗口
 	dialog, err := runtime.MessageDialog(ctx, runtime.MessageDialogOptions{
 		Type:         runtime.QuestionDialog,
 		Title:        "go-stock",
 		Message:      "确定关闭吗？",
 		Buttons:      []string{"确定", "取消"},
-		Icon:         icon,
+		Icon:         icon2,
 		CancelButton: "取消",
 	})
 
@@ -178,12 +213,12 @@ func (a *App) beforeClose(ctx context.Context) (prevent bool) {
 	}
 
 	logger.SugaredLogger.Debugf("dialog:%s", dialog)
-	if dialog == "取消" {
+	if dialog == "取消" || dialog == "No" {
 		return true // 如果选择了取消，不关闭应用
 	} else {
 		// 在 macOS 上应用退出时执行清理工作
-		a.cron.Stop() // 停止定时任务
-		return false  // 如果选择了确定，继续关闭应用
+		a.cron.Stop()
+		return false // 如果选择了确定，继续关闭应用
 	}
 }
 

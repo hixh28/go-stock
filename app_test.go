@@ -3,9 +3,12 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"go-stock/backend/data"
 	"go-stock/backend/db"
 	"go-stock/backend/logger"
 	"go-stock/backend/models"
+	"go-stock/backend/util"
+	"strings"
 	"testing"
 	"time"
 
@@ -61,4 +64,70 @@ func TestUpdateCheck(t *testing.T) {
 		return
 	}
 	logger.SugaredLogger.Infof("releaseVersion:%+v", releaseVersion)
+}
+
+func TestGetScreenResolution(t *testing.T) {
+	x, y, w, h, err := getScreenResolution()
+	if err != nil {
+		logger.SugaredLogger.Errorf("get screen resolution error:%s", err.Error())
+		return
+	}
+	logger.SugaredLogger.Infof("x:%d,y:%d,w:%d,h:%d", x, y, w, h)
+
+}
+
+func TestCheckUpdate(t *testing.T) {
+	db.Init("./data/stock.db")
+	NewApp().CheckUpdate(1)
+}
+
+func TestGetAiRecommendStocksList(t *testing.T) {
+	db.Init("./data/stock.db")
+
+	str := "{\"startDate\": \"2026-03-20 00:00:00\", \"endDate\": \"2026-03-27 23:59:59\", \"page\": 1, \"pageSize\": 5000}"
+	query := &models.AiRecommendStocksQuery{}
+	json.Unmarshal([]byte(str), query)
+
+	pageData, err := data.NewAiRecommendStocksService().GetAiRecommendStocksList(query)
+	logger.SugaredLogger.Infof("pageData:%+v", pageData.List)
+	if err != nil {
+		pageData = &models.AiRecommendStocksPageData{}
+	}
+	var dataExport []models.AiRecommendStocksMdExport
+	for _, v := range pageData.List {
+		dataExport = append(dataExport, v.ToMdExportStruct())
+	}
+	content := util.MarkdownTableWithTitle("近期AI分析/推荐股票明细列表", dataExport)
+	logger.SugaredLogger.Infof("content:%s", content)
+}
+
+func TestSummaryStockNews(t *testing.T) {
+	db.Init("./data/stock.db")
+	question := "分析今日的市场行情走势是否和券商的观点一致"
+	app := NewApp()
+	msgs := data.NewDeepSeekOpenAi(app.ctx, 0).NewSummaryStockNewsStreamWithTools(question, nil, app.AiTools, true, nil)
+
+	content := &strings.Builder{}
+	for msg := range msgs {
+		logger.SugaredLogger.Infof("msg:%+v", msg)
+		content.WriteString(msg["content"].(string))
+	}
+	logger.SugaredLogger.Infof("content:%s", content.String())
+}
+
+func TestCalculateNextRunTime(t *testing.T) {
+	db.Init("./data/stock.db")
+	t.Log(NewApp().CalculateNextRunTime("0 0 0 * * ?"))
+}
+
+func TestFetchAiModels(t *testing.T) {
+	app := NewApp()
+	models := app.FetchAiModels("https://ark.cn-beijing.volces.com/api/v3", "")
+	t.Log(models)
+
+}
+func TestGetLatestTradingDay(t *testing.T) {
+	app := NewApp()
+	date := app.GetLatestTradingDay()
+	t.Log(date)
 }

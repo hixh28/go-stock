@@ -23,7 +23,10 @@ func TestSearchStock(t *testing.T) {
 	}
 	logger.SugaredLogger.Infof("e:%s", e)
 
-	res := NewSearchStockApi("量比大于2，基本面优秀，2025年三季报已披露，主力连续3日净流入，非创业板非科创板非ST").SearchStock(20)
+	//res := NewSearchStockApi("量比大于2，基本面优秀，2025年三季报已披露，主力连续3日净流入，非创业板非科创板非ST").SearchStock(20)
+	//res := NewSearchStockApi("今日涨幅前5的概念板块").SearchBk(50)
+	res := NewSearchStockApi("今日涨幅前15的ETF").SearchETF(50)
+
 	logger.SugaredLogger.Infof("res:%+v", res)
 	data := res["data"].(map[string]any)
 	result := data["result"].(map[string]any)
@@ -60,6 +63,19 @@ func TestSearchStock(t *testing.T) {
 	logger.SugaredLogger.Infof("markdownTable=\n%s", markdownTable)
 }
 
+func TestGetStockFinancialInfo(t *testing.T) {
+	db.Init("../../data/stock.db")
+	res := NewStockDataApi().GetStockFinancialInfo("300390.SZ")
+	MD := util.MarkdownTableWithTitle("300390.SZ股票财报信息", res.Result.Data)
+	logger.SugaredLogger.Infof("res:\n%s", MD)
+}
+func TestGetStockHolderNum(t *testing.T) {
+	db.Init("../../data/stock.db")
+	res := NewStockDataApi().GetStockHolderNum("300390.SZ")
+	MD := util.MarkdownTableWithTitle("股票股东人数信息", res.Result.Data)
+	logger.SugaredLogger.Infof("res:\n%s", MD)
+}
+
 func TestSearchStockApi_HotStrategy(t *testing.T) {
 	db.Init("../../data/stock.db")
 	res := NewSearchStockApi("").HotStrategy()
@@ -79,4 +95,9 @@ func TestSearchStockApi_HotStrategy(t *testing.T) {
 	//	d := v.(map[string]any)
 	//	logger.SugaredLogger.Infof("v:%+v", d)
 	//}
+}
+func TestSearchStockApi_HotStrategyTable(t *testing.T) {
+	db.Init("../../data/stock.db")
+	res := NewSearchStockApi("").StrategySquare()
+	logger.SugaredLogger.Infof("res:%+v", res)
 }

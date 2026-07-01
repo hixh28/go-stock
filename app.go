@@ -8,190 +8,215 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"go-stock/backend/agent"
+	"go-stock/backend/agent/tools"
 	"go-stock/backend/data"
 	"go-stock/backend/db"
 	"go-stock/backend/logger"
+	"go-stock/backend/machineid"
 	"go-stock/backend/models"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/duke-git/lancet/v2/cryptor"
 	"github.com/inconshreveable/go-update"
+	"github.com/samber/lo"
 	"golang.org/x/exp/slices"
 
-	"github.com/PuerkitoBio/goquery"
 	"github.com/coocood/freecache"
 	"github.com/duke-git/lancet/v2/convertor"
 	"github.com/duke-git/lancet/v2/mathutil"
 	"github.com/duke-git/lancet/v2/slice"
 	"github.com/duke-git/lancet/v2/strutil"
-	"github.com/go-resty/resty/v2"
 	"github.com/robfig/cron/v3"
 	"github.com/wailsapp/wails/v2/pkg/runtime"
 )
 
 // App struct
 type App struct {
-	ctx         context.Context
-	cache       *freecache.Cache
-	cron        *cron.Cron
-	cronEntrys  map[string]cron.EntryID
-	AiTools     []data.Tool
-	SponsorInfo map[string]any
+	ctx                context.Context
+	cache              *freecache.Cache
+	cron               *cron.Cron
+	cronEntrys         map[string]cron.EntryID
+	cronEntrysMu       sync.Mutex
+	AiTools            []data.Tool
+	SponsorInfo        map[string]any
+	VipLevel           int64
+	summaryMu          sync.Mutex
+	summaryCancel      context.CancelFunc
+	agentMu            sync.Mutex
+	agentCancel        context.CancelFunc
+	stockAlertMu       sync.Mutex
+	stockAlertLastSent map[string]time.Time
+	priceAtAlertReset  map[string]float64
 }
 
 // NewApp creates a new App application struct
 func NewApp() *App {
 	cacheSize := 512 * 1024
 	cache := freecache.NewCache(cacheSize)
-	c := cron.New(cron.WithSeconds())
+	c := cron.New(cron.WithSeconds(), cron.WithChain(cron.Recover(cron.DefaultLogger)))
 	c.Start()
 	var tools []data.Tool
-	tools = AddTools(tools)
+	tools = data.Tools(tools)
 	return &App{
-		cache:      cache,
-		cron:       c,
-		cronEntrys: make(map[string]cron.EntryID),
-		AiTools:    tools,
+		cache:              cache,
+		cron:               c,
+		cronEntrys:         make(map[string]cron.EntryID),
+		AiTools:            tools,
+		stockAlertLastSent: make(map[string]time.Time),
+		priceAtAlertReset:  make(map[string]float64),
 	}
 }
 
-func AddTools(tools []data.Tool) []data.Tool {
-	tools = append(tools, data.Tool{
-		Type: "function",
-		Function: data.ToolFunction{
-			Name:        "SearchStockByIndicators",
-			Description: "根据自然语言筛选股票，返回自然语言选股条件要求的股票所有相关数据。输入股票名称可以获取当前股票最新的股价交易数据和基础财务指标信息，多个股票名称使用,分隔。",
-			Parameters: &data.FunctionParameters{
-				Type: "object",
-				Properties: map[string]any{
-					"words": map[string]any{
-						"type": "string",
-						"description": "选股自然语言。" +
-							"例如，查看技术指标：上海贝岭,macd,rsi,kdj,boll,5日均线,14日均线,30日均线,60日均线,成交量,OBV,EMA" +
-							"例如，查看有潜力的成交量爆发股：最近7日成交量量比大于3，出现过一次，非ST" +
-							"例1：创新药,半导体;PE<30;净利润增长率>50%。 " +
-							"例2：上证指数,科创50。 " +
-							"例3：长电科技,上海贝岭。" +
-							"例4：长电科技,上海贝岭;KDJ,MACD,RSI,BOLL,主力资金" +
-							"例5：换手率大于3%小于25%.量比1以上. 10日内有过涨停.股价处于峰值的二分之一以下.流通股本<100亿.当日和连续四日净流入;股价在20日均线以上.分时图股价在均线之上.热门板块下涨幅领先的A股. 当日量能20000手以上.沪深个股.近一年市盈率波动小于150%.MACD金叉;不要ST股及不要退市股，非北交所，每股收益>0。" +
-							"例6：沪深主板.流通市值小于100亿.市值大于10亿.60分钟dif大于dea.60分钟skdj指标k值大于d值.skdj指标k值小于90.换手率大于3%.成交额大于1亿元.量比大于2.涨幅大于2%小于7%.股价大于5小于50.创业板.10日均线大于20日均线;不要ST股及不要退市股;不要北交所;不要科创板;不要创业板。" +
-							"例7：股价在20日线上，一月之内涨停次数>=1，量比大于1，换手率大于3%" +
-							"例8：基本条件：前期有爆量，回调到 10 日线，当日是缩量阴线，均线趋势向上。;优选条件：一月之内涨停次数>=1",
-					},
-				},
-				Required: []string{"words"},
-			},
-		},
-	})
+func (a *App) setCronEntry(key string, id cron.EntryID) {
+	a.cronEntrysMu.Lock()
+	a.cronEntrys[key] = id
+	a.cronEntrysMu.Unlock()
+}
 
-	tools = append(tools, data.Tool{
-		Type: "function",
-		Function: data.ToolFunction{
-			Name:        "GetStockKLine",
-			Description: "获取股票日K线数据。",
-			Parameters: &data.FunctionParameters{
-				Type: "object",
-				Properties: map[string]any{
-					"days": map[string]any{
-						"type":        "string",
-						"description": "日K数据条数",
-					},
-					"stockCode": map[string]any{
-						"type":        "string",
-						"description": "股票代码（A股：sh,sz开头;港股hk开头,美股：us开头）",
-					},
-				},
-				Required: []string{"days", "stockCode"},
-			},
-		},
-	})
+func (a *App) getCronEntry(key string) (cron.EntryID, bool) {
+	a.cronEntrysMu.Lock()
+	id, exists := a.cronEntrys[key]
+	a.cronEntrysMu.Unlock()
+	return id, exists
+}
 
-	tools = append(tools, data.Tool{
-		Type: "function",
-		Function: data.ToolFunction{
-			Name:        "InteractiveAnswer",
-			Description: "获取投资者与上市公司互动问答的数据,反映当前投资者关注的热点问题",
-			Parameters: &data.FunctionParameters{
-				Type: "object",
-				Properties: map[string]any{
-					"page": map[string]any{
-						"type":        "string",
-						"description": "分页号",
-					},
-					"pageSize": map[string]any{
-						"type":        "string",
-						"description": "分页大小",
-					},
-					"keyWord": map[string]any{
-						"type":        "string",
-						"description": "搜索关键词（可输入股票名称或者当前热门板块/行业/概念/标的/事件等）",
-					},
-				},
-				Required: []string{"page", "pageSize"},
-			},
-		},
-	})
-
-	//tools = append(tools, data.Tool{
-	//	Type: "function",
-	//	Function: data.ToolFunction{
-	//		Name:        "QueryBKDictInfo",
-	//		Description: "获取所有板块/行业名称或者代码(bkCode,bkName)",
-	//	},
-	//})
-
-	//tools = append(tools, data.Tool{
-	//	Type: "function",
-	//	Function: data.ToolFunction{
-	//		Name:        "GetIndustryResearchReport",
-	//		Description: "获取行业/板块研究报告,请先使用QueryBKDictInfo工具获取行业代码，然后输入行业代码调用",
-	//		Parameters: data.FunctionParameters{
-	//			Type: "object",
-	//			Properties: map[string]any{
-	//				"bkCode": map[string]any{
-	//					"type":        "string",
-	//					"description": "板块/行业代码",
-	//				},
-	//			},
-	//			Required: []string{"bkCode"},
-	//		},
-	//	},
-	//})
-
-	tools = append(tools, data.Tool{
-		Type: "function",
-		Function: data.ToolFunction{
-			Name:        "GetStockResearchReport",
-			Description: "获取市场分析师的股票研究报告",
-			Parameters: &data.FunctionParameters{
-				Type: "object",
-				Properties: map[string]any{
-					"stockCode": map[string]any{
-						"type":        "string",
-						"description": "股票代码",
-					},
-				},
-				Required: []string{"stockCode"},
-			},
-		},
-	})
-
-	tools = append(tools, data.Tool{
-		Type: "function",
-		Function: data.ToolFunction{
-			Name:        "HotStrategyTable",
-			Description: "获取当前热门选股策略",
-		},
-	})
-
-	return tools
+func (a *App) removeCronEntry(key string) {
+	a.cronEntrysMu.Lock()
+	delete(a.cronEntrys, key)
+	a.cronEntrysMu.Unlock()
 }
 
 func (a *App) GetSponsorInfo() map[string]any {
 	return a.SponsorInfo
+}
+
+// GetEffectiveSponsorVip 从本地配置解密赞助信息并判断当前是否在 VIP 有效期内（与 ai-assistant-web / data.EffectiveSponsorVipLevel 一致）。
+func (a *App) GetEffectiveSponsorVip() map[string]any {
+	level, active := data.EffectiveSponsorVipLevel()
+	return map[string]any{
+		"vipLevel": level,
+		"active":   active,
+	}
+}
+
+func (a *App) GetMachineId() string {
+	return machineid.GetMachineId()
+}
+
+func (a *App) CheckDeviceBinding(token string, apiBase string) map[string]any {
+	uuid := machineid.GetMachineId()
+	result := map[string]any{
+		"bound":       false,
+		"deviceCount": 0,
+		"maxDevices":  5,
+	}
+
+	if token == "" || apiBase == "" {
+		return result
+	}
+
+	url := fmt.Sprintf("%s/user/device-check?uuid=%s", apiBase, uuid)
+	resp, err := data.SharedHTTPClient.R().
+		SetHeader("Authorization", "Bearer "+token).
+		Get(url)
+	if err != nil {
+		return result
+	}
+
+	var respData struct {
+		Code int `json:"code"`
+		Data struct {
+			Bound       bool `json:"bound"`
+			DeviceCount int  `json:"deviceCount"`
+			MaxDevices  int  `json:"maxDevices"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(resp.Body(), &respData); err != nil {
+		return result
+	}
+	if respData.Code != 0 {
+		return result
+	}
+
+	result["bound"] = respData.Data.Bound
+	result["deviceCount"] = respData.Data.DeviceCount
+	result["maxDevices"] = respData.Data.MaxDevices
+	return result
+}
+
+// PromptPlazaRequest 以 Go 后端代理的方式请求提示词广场 API，
+// 规避 macOS WKWebView 的 App Transport Security 对明文 HTTP 的限制，
+// 前端不应直接 fetch 远程广场接口。
+// method: GET/POST/PUT/DELETE
+// apiBase: 广场 API 根地址，如 http://go-stock.sparkmemory.top:1918/api
+// path: 接口路径，如 /auth/register
+// query: URL 查询参数，可为 nil；nil 值与空字符串会被跳过，与前端原 fetch 行为一致
+// body: 请求体 JSON 字符串，可为空
+// token: 鉴权 token，可为空
+// 返回响应体解析后的 map（含 code/message/data），网络或解析失败时 code != 0。
+func (a *App) PromptPlazaRequest(method, apiBase, path string, query map[string]any, body, token string) map[string]any {
+	result := map[string]any{"code": -1, "message": "", "data": nil}
+	if apiBase == "" {
+		result["message"] = "apiBase 为空"
+		return result
+	}
+	url := strings.TrimRight(apiBase, "/") + path
+	req := data.SharedHTTPClient.R().SetHeader("Content-Type", "application/json")
+	if token != "" {
+		req = req.SetHeader("Authorization", "Bearer "+token)
+	}
+	if len(query) > 0 {
+		params := make(map[string]string, len(query))
+		for k, v := range query {
+			if v == nil {
+				continue
+			}
+			s := fmt.Sprintf("%v", v)
+			if s == "" {
+				continue
+			}
+			params[k] = s
+		}
+		if len(params) > 0 {
+			req = req.SetQueryParams(params)
+		}
+	}
+	if body != "" {
+		req = req.SetBody(body)
+	}
+
+	resp, err := req.Execute(strings.ToUpper(method), url)
+	if err != nil {
+		result["message"] = err.Error()
+		return result
+	}
+
+	var respData map[string]any
+	if err := json.Unmarshal(resp.Body(), &respData); err != nil {
+		result["message"] = "响应解析失败: " + err.Error()
+		return result
+	}
+	if respData == nil {
+		respData = map[string]any{}
+	}
+	if _, ok := respData["code"]; !ok {
+		respData["code"] = -1
+	}
+	return respData
+}
+
+func (a *App) QuitApp() {
+	if a.ctx != nil {
+		if a.cron != nil {
+			a.cron.Stop()
+		}
+		runtime.Quit(a.ctx)
+	}
 }
 func (a *App) CheckSponsorCode(sponsorCode string) map[string]any {
 	sponsorCode = strutil.Trim(sponsorCode)
@@ -218,6 +243,15 @@ func (a *App) CheckSponsorCode(sponsorCode string) map[string]any {
 				"msg":  "赞助码错误，请输入正确的赞助码!",
 			}
 		}
+
+		// 校验通过后，将赞助码持久化到 Settings 中
+		config := data.GetSettingConfig()
+		// 只在赞助码变更时写库，避免无谓更新
+		if config.SponsorCode != sponsorCode {
+			config.SponsorCode = sponsorCode
+			data.UpdateConfig(config)
+		}
+
 		return map[string]any{
 			"code": 1,
 			"msg":  "赞助码校验成功，感谢您的支持!",
@@ -248,18 +282,66 @@ func (a *App) CheckUpdate(flag int) {
 		}
 	}
 
-	releaseVersion := &models.GitHubReleaseVersion{}
-	_, err := resty.New().R().
-		SetResult(releaseVersion).
-		Get("https://api.github.com/repos/ArvinLovegood/go-stock/releases/latest")
-	if err != nil {
-		logger.SugaredLogger.Errorf("get github release version error:%s", err.Error())
-		return
+	updateChannel := a.GetConfig().UpdateChannel
+	if updateChannel == "" {
+		updateChannel = "release"
 	}
-	logger.SugaredLogger.Infof("releaseVersion:%+v", releaseVersion.TagName)
+
+	githubApiHeaders := map[string]string{
+		"Accept":               "application/vnd.github+json",
+		"X-GitHub-Api-Version": "2022-11-28",
+	}
+
+	releaseVersion := &models.GitHubReleaseVersion{}
+	if updateChannel == "release" {
+		resp, err := data.SharedHTTPClient.R().
+			SetHeaders(githubApiHeaders).
+			SetResult(releaseVersion).
+			Get("https://api.github.com/repos/ArvinLovegood/go-stock/releases/latest")
+		if err != nil {
+			logger.SugaredLogger.Errorf("get github release version error:%s", err.Error())
+			return
+		}
+		if resp.StatusCode() != 200 {
+			logger.SugaredLogger.Errorf("get github release version failed, status:%d", resp.StatusCode())
+			return
+		}
+	} else {
+		var releases []models.GitHubReleaseVersion
+		resp, err := data.SharedHTTPClient.R().
+			SetHeaders(githubApiHeaders).
+			SetResult(&releases).
+			Get("https://api.github.com/repos/ArvinLovegood/go-stock/releases")
+		if err != nil {
+			logger.SugaredLogger.Errorf("get github releases error:%s", err.Error())
+			return
+		}
+		if resp.StatusCode() != 200 {
+			logger.SugaredLogger.Errorf("get github releases failed, status:%d", resp.StatusCode())
+			return
+		}
+		if len(releases) == 0 {
+			logger.SugaredLogger.Errorf("no releases found")
+			return
+		}
+		if updateChannel == "pre" {
+			for _, r := range releases {
+				if !r.Draft {
+					releaseVersion = &r
+					break
+				}
+			}
+			if releaseVersion.TagName == "" {
+				releaseVersion = &releases[0]
+			}
+		} else {
+			releaseVersion = &releases[0]
+		}
+	}
 
 	if _, vipLevel, ok := a.isVip(sponsorCode, "", releaseVersion); ok {
 		level, _ := convertor.ToInt(vipLevel)
+		a.VipLevel = level
 		if level >= 2 {
 			go a.syncNews()
 		}
@@ -267,57 +349,119 @@ func (a *App) CheckUpdate(flag int) {
 
 	if releaseVersion.TagName != Version {
 		tag := &models.Tag{}
-		_, err = resty.New().R().
+		tagResp, tagErr := data.SharedHTTPClient.R().
+			SetHeaders(githubApiHeaders).
 			SetResult(tag).
 			Get("https://api.github.com/repos/ArvinLovegood/go-stock/git/ref/tags/" + releaseVersion.TagName)
-		if err == nil {
+		if tagErr == nil && tagResp.StatusCode() == 200 && tag.Object.Url != "" {
 			releaseVersion.Tag = *tag
+			commit := &models.Commit{}
+			commitResp, commitErr := data.SharedHTTPClient.R().
+				SetHeaders(githubApiHeaders).
+				SetResult(commit).
+				Get(tag.Object.Url)
+			if commitErr == nil && commitResp.StatusCode() == 200 {
+				releaseVersion.Commit = *commit
+			}
 		}
 
-		commit := &models.Commit{}
-		_, err = resty.New().R().
-			SetResult(commit).
-			Get(tag.Object.Url)
-		if err == nil {
-			releaseVersion.Commit = *commit
+		commitMessage := releaseVersion.Body
+		if releaseVersion.Commit.Message != "" {
+			commitMessage = releaseVersion.Commit.Message
 		}
 
-		if !(IsWindows() || IsMacOS()) {
-			go runtime.EventsEmit(a.ctx, "updateVersion", releaseVersion)
-			return
+		downloadUrl := ""
+		assetName := ""
+		if IsWindows() {
+			if IsArm64() {
+				assetName = "go-stock-windows-arm64.exe"
+			} else {
+				assetName = "go-stock-windows-amd64.exe"
+			}
+		} else if IsMacOS() {
+			assetName = "go-stock-darwin-universal"
+		} else if IsLinux() {
+			assetName = "go-stock-linux-amd64"
 		}
-		downloadUrl := fmt.Sprintf("https://github.com/ArvinLovegood/go-stock/releases/download/%s/go-stock-windows-amd64.exe", releaseVersion.TagName)
-		if IsMacOS() {
-			downloadUrl = fmt.Sprintf("https://github.com/ArvinLovegood/go-stock/releases/download/%s/go-stock-darwin-universal", releaseVersion.TagName)
+
+		for _, asset := range releaseVersion.Assets {
+			if asset.Name == assetName {
+				downloadUrl = asset.BrowserDownloadUrl
+				break
+			}
 		}
-		downloadUrl, _, done := a.isVip(sponsorCode, downloadUrl, releaseVersion)
-		if !done {
-			return
+
+		if downloadUrl == "" {
+			downloadUrl = fmt.Sprintf("https://github.com/ArvinLovegood/go-stock/releases/download/%s/%s", releaseVersion.TagName, assetName)
 		}
+
+		originalDownloadUrl := downloadUrl
+		downloadUrl, _, _ = a.isVip(sponsorCode, downloadUrl, releaseVersion)
+		mirrorDownloadUrl := "https://gh.927223.xyz/" + originalDownloadUrl
+		manualDownloadTip := fmt.Sprintf("\n手动下载链接(加速镜像): %s\n手动下载链接(原始地址): %s\n下载后请替换当前程序文件即可完成更新。", mirrorDownloadUrl, originalDownloadUrl)
+
 		go runtime.EventsEmit(a.ctx, "newsPush", map[string]any{
 			"time":    "发现新版本：" + releaseVersion.TagName,
 			"isRed":   true,
 			"source":  "go-stock",
-			"content": fmt.Sprintf("%s", commit.Message),
+			"content": commitMessage + "\n正在下载新版本，请耐心等待...",
 		})
-		resp, err := resty.New().R().Get(downloadUrl)
+
+		tmpFile, err := os.CreateTemp("", "go-stock-update-*.tmp")
 		if err != nil {
+			logger.SugaredLogger.Errorf("create temp file error: %s", err.Error())
 			go runtime.EventsEmit(a.ctx, "newsPush", map[string]any{
 				"time":    "新版本：" + releaseVersion.TagName,
 				"isRed":   true,
 				"source":  "go-stock",
-				"content": commit.Message + "\n新版本下载失败,请稍后重试或请前往 https://github.com/ArvinLovegood/go-stock/releases 手动下载替换文件。",
+				"content": commitMessage + "\n新版本下载失败(无法创建临时文件)。" + manualDownloadTip,
 			})
 			return
 		}
-		body := resp.Body()
+		tmpPath := tmpFile.Name()
+		tmpFile.Close()
+		defer os.Remove(tmpPath)
 
-		if len(body) < 1024*500 {
+		downloadClient := data.CreateDownloadClient()
+
+		downloadUrls := []string{mirrorDownloadUrl, downloadUrl}
+		var downloadSuccess bool
+		for _, url := range downloadUrls {
+			_, err = downloadClient.R().
+				SetHeader("User-Agent", "go-stock-updater").
+				SetOutput(tmpPath).
+				Get(url)
+			if err != nil {
+				logger.SugaredLogger.Warnf("download from %s error: %s, trying next...", url, err.Error())
+				continue
+			}
+			fileInfo, statErr := os.Stat(tmpPath)
+			if statErr != nil || fileInfo.Size() < 1024*500 {
+				logger.SugaredLogger.Warnf("download from %s file size invalid, trying next...", url)
+				continue
+			}
+			downloadSuccess = true
+			break
+		}
+
+		if !downloadSuccess {
 			go runtime.EventsEmit(a.ctx, "newsPush", map[string]any{
 				"time":    "新版本：" + releaseVersion.TagName,
 				"isRed":   true,
 				"source":  "go-stock",
-				"content": commit.Message + "\n新版本下载失败,请稍后重试或请前往 https://github.com/ArvinLovegood/go-stock/releases 手动下载替换文件。",
+				"content": commitMessage + "\n新版本自动下载失败，请手动下载更新。" + manualDownloadTip,
+			})
+			return
+		}
+
+		body, err := os.ReadFile(tmpPath)
+		if err != nil {
+			logger.SugaredLogger.Errorf("read downloaded file error: %s", err.Error())
+			go runtime.EventsEmit(a.ctx, "newsPush", map[string]any{
+				"time":    "新版本：" + releaseVersion.TagName,
+				"isRed":   true,
+				"source":  "go-stock",
+				"content": commitMessage + "\n新版本下载失败(无法读取临时文件)。" + manualDownloadTip,
 			})
 			return
 		}
@@ -325,7 +469,14 @@ func (a *App) CheckUpdate(flag int) {
 		err = update.Apply(bytes.NewReader(body), update.Options{})
 		if err != nil {
 			logger.SugaredLogger.Error("更新失败: ", err.Error())
-			go runtime.EventsEmit(a.ctx, "updateVersion", releaseVersion)
+			if !IsRunningAsAdmin() {
+				go runtime.EventsEmit(a.ctx, "updateNeedAdmin", map[string]any{
+					"version": releaseVersion.TagName,
+					"message": commitMessage,
+				})
+			} else {
+				go runtime.EventsEmit(a.ctx, "updateVersion", releaseVersion)
+			}
 			return
 		} else {
 			go runtime.EventsEmit(a.ctx, "newsPush", map[string]any{
@@ -383,25 +534,40 @@ func (a *App) isVip(sponsorCode string, downloadUrl string, releaseVersion *mode
 		}
 
 		if IsWindows() {
+			winAssetName := "go-stock-windows-amd64.exe"
+			if IsArm64() {
+				winAssetName = "go-stock-windows-arm64.exe"
+			}
 			if isVip {
 				if a.SponsorInfo["winDownUrl"] == nil {
-					downloadUrl = fmt.Sprintf("https://gitproxy.click/https://github.com/ArvinLovegood/go-stock/releases/download/%s/go-stock-windows-amd64.exe", releaseVersion.TagName)
+					downloadUrl = fmt.Sprintf("https://gh.927223.xyz/https://github.com/ArvinLovegood/go-stock/releases/download/%s/%s", releaseVersion.TagName, winAssetName)
 				} else {
 					downloadUrl = a.SponsorInfo["winDownUrl"].(string)
 				}
 			} else {
-				downloadUrl = fmt.Sprintf("https://github.com/ArvinLovegood/go-stock/releases/download/%s/go-stock-windows-amd64.exe", releaseVersion.TagName)
+				downloadUrl = fmt.Sprintf("https://github.com/ArvinLovegood/go-stock/releases/download/%s/%s", releaseVersion.TagName, winAssetName)
 			}
 		}
 		if IsMacOS() {
 			if isVip {
 				if a.SponsorInfo["macDownUrl"] == nil {
-					downloadUrl = fmt.Sprintf("https://gitproxy.click/https://github.com/ArvinLovegood/go-stock/releases/download/%s/go-stock-darwin-universal", releaseVersion.TagName)
+					downloadUrl = fmt.Sprintf("https://gh.927223.xyz/https://github.com/ArvinLovegood/go-stock/releases/download/%s/go-stock-darwin-universal", releaseVersion.TagName)
 				} else {
 					downloadUrl = a.SponsorInfo["macDownUrl"].(string)
 				}
 			} else {
 				downloadUrl = fmt.Sprintf("https://github.com/ArvinLovegood/go-stock/releases/download/%s/go-stock-darwin-universal", releaseVersion.TagName)
+			}
+		}
+		if IsLinux() {
+			if isVip {
+				if a.SponsorInfo["linuxDownUrl"] == nil {
+					downloadUrl = fmt.Sprintf("https://gh.927223.xyz/https://github.com/ArvinLovegood/go-stock/releases/download/%s/go-stock-linux-amd64", releaseVersion.TagName)
+				} else {
+					downloadUrl = a.SponsorInfo["linuxDownUrl"].(string)
+				}
+			} else {
+				downloadUrl = fmt.Sprintf("https://github.com/ArvinLovegood/go-stock/releases/download/%s/go-stock-linux-amd64", releaseVersion.TagName)
 			}
 		}
 
@@ -411,9 +577,9 @@ func (a *App) isVip(sponsorCode string, downloadUrl string, releaseVersion *mode
 
 func (a *App) syncNews() {
 	defer PanicHandler()
-	client := resty.New()
+	client := data.SharedHTTPClient
 	url := fmt.Sprintf("http://go-stock.sparkmemory.top:16666/FinancialNews/json?since=%d", time.Now().Add(-24*time.Hour).Unix())
-	logger.SugaredLogger.Infof("syncNews:%s", url)
+	//logger.SugaredLogger.Infof("syncNews:%s", url)
 	resp, err := client.R().SetDoNotParseResponse(true).Get(url)
 	body := resp.RawBody()
 	defer body.Close()
@@ -422,8 +588,8 @@ func (a *App) syncNews() {
 	}
 	scanner := bufio.NewScanner(body)
 	for scanner.Scan() {
-		line := scanner.Text()
-		logger.SugaredLogger.Infof("Received data: %s", line)
+		//line := scanner.Text()
+		//logger.SugaredLogger.Infof("Received data: %s", line)
 		news := &models.NtfyNews{}
 		err := json.Unmarshal(scanner.Bytes(), news)
 		if err != nil {
@@ -431,7 +597,7 @@ func (a *App) syncNews() {
 		}
 		dataTime := time.UnixMilli(int64(news.Time * 1000))
 
-		if slice.ContainAny(news.Tags, []string{"外媒资讯", "财联社电报", "新浪财经"}) {
+		if slice.ContainAny(news.Tags, []string{"外媒资讯", "财联社电报", "新浪财经", "外媒简讯", "外媒"}) {
 			isRed := false
 			if slice.Contain(news.Tags, "rotating_light") {
 				isRed = true
@@ -453,8 +619,14 @@ func (a *App) syncNews() {
 			}
 			if cnt == 0 {
 				db.Dao.Model(telegraph).Create(&telegraph)
-				a.NewsPush(&[]models.Telegraph{*telegraph})
-				for _, subject := range news.Tags {
+				//计算时间差如果<5分钟则推送
+				if time.Now().Sub(dataTime) < 5*time.Minute {
+					a.NewsPush(&[]models.Telegraph{*telegraph})
+				}
+				tags := slice.Filter(news.Tags, func(index int, item string) bool {
+					return !(item == "rotating_light" || item == "loudspeaker")
+				})
+				for _, subject := range tags {
 					tag := &models.Tags{
 						Name: subject,
 						Type: "subject",
@@ -471,7 +643,7 @@ func (a *App) syncNews() {
 }
 
 func GetSource(tags []string) string {
-	if slices.Contains(tags, "外媒简讯") {
+	if slice.ContainAny(tags, []string{"外媒简讯", "外媒资讯", "外媒"}) {
 		return "外媒"
 	}
 	if slices.Contains(tags, "财联社电报") {
@@ -522,10 +694,6 @@ func (a *App) domReady(ctx context.Context) {
 		if interval <= 0 {
 			interval = 1
 		}
-		a.cron.AddFunc(fmt.Sprintf("@every %ds", interval+60), func() {
-			data.NewsAnalyze("", true)
-		})
-
 		//ticker := time.NewTicker(time.Second * time.Duration(interval))
 		//defer ticker.Stop()
 		//for range ticker.C {
@@ -537,12 +705,12 @@ func (a *App) domReady(ctx context.Context) {
 		if err != nil {
 			logger.SugaredLogger.Errorf("AddFunc error:%s", err.Error())
 		} else {
-			a.cronEntrys["MonitorStockPrices"] = id
+			a.setCronEntry("MonitorStockPrices", id)
 		}
 		entryID, err := a.cron.AddFunc(fmt.Sprintf("@every %ds", interval+10), func() {
 			//news := data.NewMarketNewsApi().GetNewTelegraph(30)
 			news := data.NewMarketNewsApi().TelegraphList(30)
-			if config.EnablePushNews {
+			if data.GetSettingConfig().EnablePushNews {
 				go a.NewsPush(news)
 			}
 			go runtime.EventsEmit(a.ctx, "newTelegraph", news)
@@ -550,12 +718,12 @@ func (a *App) domReady(ctx context.Context) {
 		if err != nil {
 			logger.SugaredLogger.Errorf("AddFunc error:%s", err.Error())
 		} else {
-			a.cronEntrys["GetNewTelegraph"] = entryID
+			a.setCronEntry("GetNewTelegraph", entryID)
 		}
 
 		entryIDSina, err := a.cron.AddFunc(fmt.Sprintf("@every %ds", interval+10), func() {
 			news := data.NewMarketNewsApi().GetSinaNews(30)
-			if config.EnablePushNews {
+			if data.GetSettingConfig().EnablePushNews {
 				go a.NewsPush(news)
 			}
 			go runtime.EventsEmit(a.ctx, "newSinaNews", news)
@@ -563,12 +731,12 @@ func (a *App) domReady(ctx context.Context) {
 		if err != nil {
 			logger.SugaredLogger.Errorf("AddFunc error:%s", err.Error())
 		} else {
-			a.cronEntrys["newSinaNews"] = entryIDSina
+			a.setCronEntry("newSinaNews", entryIDSina)
 		}
 
 		entryIDTradingViewNews, err := a.cron.AddFunc(fmt.Sprintf("@every %ds", interval+10), func() {
 			news := data.NewMarketNewsApi().TradingViewNews()
-			if config.EnablePushNews {
+			if data.GetSettingConfig().EnablePushNews {
 				go a.NewsPush(news)
 			}
 			go runtime.EventsEmit(a.ctx, "tradingViewNews", news)
@@ -576,7 +744,7 @@ func (a *App) domReady(ctx context.Context) {
 		if err != nil {
 			logger.SugaredLogger.Errorf("AddFunc error:%s", err.Error())
 		} else {
-			a.cronEntrys["tradingViewNews"] = entryIDTradingViewNews
+			a.setCronEntry("tradingViewNews", entryIDTradingViewNews)
 		}
 	}()
 
@@ -594,8 +762,28 @@ func (a *App) domReady(ctx context.Context) {
 			if err != nil {
 				logger.SugaredLogger.Errorf("AddFunc error:%s", err.Error())
 			} else {
-				a.cronEntrys["MonitorFundPrices"] = id
+				a.setCronEntry("MonitorFundPrices", id)
 			}
+		}
+
+		// AI 推荐股票价格监控定时器
+		idAiStock, err := a.cron.AddFunc(fmt.Sprintf("@every %ds", 60), func() {
+			MonitorAiRecommendStockPrices(a)
+		})
+		if err != nil {
+			logger.SugaredLogger.Errorf("AddFunc MonitorAiRecommendStockPrices error:%s", err.Error())
+		} else {
+			a.setCronEntry("MonitorAiRecommendStockPrices", idAiStock)
+		}
+
+		// 自选股成本价监控定时器
+		idCostPrice, err := a.cron.AddFunc(fmt.Sprintf("@every %ds", 60), func() {
+			MonitorFollowedStockCostPrices(a)
+		})
+		if err != nil {
+			logger.SugaredLogger.Errorf("AddFunc MonitorFollowedStockCostPrices error:%s", err.Error())
+		} else {
+			a.setCronEntry("MonitorFollowedStockCostPrices", idCostPrice)
 		}
 
 	}()
@@ -622,7 +810,7 @@ func (a *App) domReady(ctx context.Context) {
 		if err != nil {
 			logger.SugaredLogger.Errorf("AddFunc error:%s", err.Error())
 		} else {
-			a.cronEntrys["refreshTelegraphList"] = id
+			a.setCronEntry("refreshTelegraphList", id)
 		}
 
 		go runtime.EventsEmit(a.ctx, "telegraph", refreshTelegraphList())
@@ -632,10 +820,55 @@ func (a *App) domReady(ctx context.Context) {
 		go MonitorFundPrices(a)
 		go data.NewFundApi().AllFund()
 	}
+	// AI 推荐股票价格监控
+	go MonitorAiRecommendStockPrices(a)
+	// 自选股成本价监控
+	go MonitorFollowedStockCostPrices(a)
+	// 市场统计数据采集（交易日每5分钟）
+	go func() {
+		a.FetchAndSaveMarketStatistic()
+		idMarketStat, err := a.cron.AddFunc("0 */5 9-15 * * 1-5", func() {
+			a.FetchAndSaveMarketStatistic()
+		})
+		if err != nil {
+			logger.SugaredLogger.Errorf("AddFunc FetchAndSaveMarketStatistic error:%s", err.Error())
+		} else {
+			a.setCronEntry("FetchAndSaveMarketStatistic", idMarketStat)
+		}
+	}()
+	// 板块资金流向数据采集（交易日每60秒）
+	go func() {
+		data.NewBKFundFlowApi().FetchAndSave()
+		idBKFundFlow, err := a.cron.AddFunc("@every 60s", func() {
+			if a.IsTradingTime() {
+				data.NewBKFundFlowApi().FetchAndSave()
+			}
+		})
+		if err != nil {
+			logger.SugaredLogger.Errorf("AddFunc BKFundFlowFetchAndSave error:%s", err.Error())
+		} else {
+			a.setCronEntry("BKFundFlowFetchAndSave", idBKFundFlow)
+		}
+	}()
+	// 概念资金流向数据采集（交易日每60秒）
+	go func() {
+		data.NewConceptFundFlowApi().FetchAndSave()
+		idConceptFundFlow, err := a.cron.AddFunc("@every 60s", func() {
+			if a.IsTradingTime() {
+				data.NewConceptFundFlowApi().FetchAndSave()
+			}
+		})
+		if err != nil {
+			logger.SugaredLogger.Errorf("AddFunc ConceptFundFlowFetchAndSave error:%s", err.Error())
+		} else {
+			a.setCronEntry("ConceptFundFlowFetchAndSave", idConceptFundFlow)
+		}
+	}()
 	//检查新版本
 	go func() {
 		a.CheckUpdate(0)
 		go a.CheckStockBaseInfo(a.ctx)
+		go syncAllStockInfo(a.ctx)
 
 		a.cron.AddFunc("0 0 2 * * *", func() {
 			logger.SugaredLogger.Errorf("Checking for updates...")
@@ -644,6 +877,9 @@ func (a *App) domReady(ctx context.Context) {
 		a.cron.AddFunc("30 05 8,12,20 * * *", func() {
 			logger.SugaredLogger.Errorf("Checking for updates...")
 			a.CheckUpdate(0)
+		})
+		a.cron.AddFunc("30 05 8,12,20 * * *", func() {
+			syncAllStockInfo(a.ctx)
 		})
 	}()
 
@@ -674,10 +910,29 @@ func (a *App) domReady(ctx context.Context) {
 			logger.SugaredLogger.Errorf("添加自动分析任务失败:%s cron=%s entryID:%v", follow.Name, *follow.Cron, entryID)
 			continue
 		}
-		a.cronEntrys[follow.StockCode] = entryID
+		a.setCronEntry(follow.StockCode, entryID)
 	}
-	logger.SugaredLogger.Infof("domReady-cronEntrys:%+v", a.cronEntrys)
+	//logger.SugaredLogger.Infof("domReady-cronEntrys:%+v", a.cronEntrys)
 
+}
+
+func syncAllStockInfo(ctx context.Context) {
+	defer PanicHandler()
+	defer func() {
+		go runtime.EventsEmit(ctx, "loadingMsg", "done")
+	}()
+	db.Dao.Unscoped().Model(&models.AllStockInfo{}).Where("1=1").Delete(&models.AllStockInfo{})
+	for page := 1; page < 3; page++ {
+		res := data.NewStockDataApi().GetAllStocks(page, 3000, "", models.TechnicalIndicators{})
+		var datas []models.AllStockInfo
+		for _, data := range (*res).Result.Data {
+			datas = append(datas, data.ToAllStockInfo())
+		}
+		err := db.Dao.CreateInBatches(&datas, 1000).Error
+		if err != nil {
+			logger.SugaredLogger.Errorf("db.Dao.CreateInBatches error:%s", err.Error())
+		}
+	}
 }
 func (a *App) CheckStockBaseInfo(ctx context.Context) {
 	defer PanicHandler()
@@ -685,7 +940,7 @@ func (a *App) CheckStockBaseInfo(ctx context.Context) {
 		go runtime.EventsEmit(ctx, "loadingMsg", "done")
 	}()
 	stockBasics := &[]data.StockBasic{}
-	resty.New().R().
+	data.SharedHTTPClient.R().
 		SetHeader("user", "go-stock").
 		SetResult(stockBasics).
 		Get("http://8.134.249.145:18080/go-stock/stock_basic.json")
@@ -695,6 +950,8 @@ func (a *App) CheckStockBaseInfo(ctx context.Context) {
 	if err != nil {
 		logger.SugaredLogger.Errorf("保存StockBasic股票基础信息失败:%s", err.Error())
 	}
+	// 全量覆盖完成后，用通达信即时数据对 A 股做增量校准（新股上市当天即可见）
+	go a.syncStockBasicFromTdx()
 
 	//count := int64(0)
 	//db.Dao.Model(&data.StockBasic{}).Count(&count)
@@ -718,7 +975,7 @@ func (a *App) CheckStockBaseInfo(ctx context.Context) {
 	//}
 
 	stockHKBasics := &[]models.StockInfoHK{}
-	resty.New().R().
+	data.SharedHTTPClient.R().
 		SetHeader("user", "go-stock").
 		SetResult(stockHKBasics).
 		Get("http://8.134.249.145:18080/go-stock/stock_base_info_hk.json")
@@ -744,7 +1001,7 @@ func (a *App) CheckStockBaseInfo(ctx context.Context) {
 	//	}
 	//}
 	stockUSBasics := &[]models.StockInfoUS{}
-	resty.New().R().
+	data.SharedHTTPClient.R().
 		SetHeader("user", "go-stock").
 		SetResult(stockUSBasics).
 		Get("http://8.134.249.145:18080/go-stock/stock_base_info_us.json")
@@ -754,6 +1011,8 @@ func (a *App) CheckStockBaseInfo(ctx context.Context) {
 	if err != nil {
 		logger.SugaredLogger.Errorf("保存StockInfoUS股票基础信息失败:%s", err.Error())
 	}
+	// 港股/美股全量覆盖完成后，用通达信扩展行情即时数据做增量校准
+	go a.syncHKUSStockBasicFromTdx()
 	//for _, stock := range *stockUSBasics {
 	//	stockInfo := &models.StockInfoUS{
 	//		Code:   stock.Code,
@@ -769,6 +1028,31 @@ func (a *App) CheckStockBaseInfo(ctx context.Context) {
 	//	}
 	//}
 
+}
+
+// syncStockBasicFromTdx 用通达信即时数据对 A 股基础信息做增量校准。
+// 在 CheckStockBaseInfo 全量覆盖之后调用：通达信本地证券列表新股上市当天即可见，
+// 以 upsert 方式补充全量 JSON 未及时覆盖的新上市/改名/退市股票。
+func (a *App) syncStockBasicFromTdx() {
+	defer PanicHandler()
+	added, updated, err := data.NewTdxKLineApi().SyncStockBasicToDB()
+	if err != nil {
+		logger.SugaredLogger.Warnf("通达信同步股票基础信息失败:%s", err.Error())
+		return
+	}
+	logger.SugaredLogger.Infof("通达信同步股票基础信息完成：新增 %d 条，更新 %d 条", added, updated)
+}
+
+// syncHKUSStockBasicFromTdx 用通达信扩展行情即时数据对港股/美股基础信息做增量校准。
+func (a *App) syncHKUSStockBasicFromTdx() {
+	defer PanicHandler()
+	hkAdded, hkUpdated, usAdded, usUpdated, err := data.NewTdxKLineApi().SyncHKUSStockBasicToDB()
+	if err != nil {
+		logger.SugaredLogger.Warnf("通达信同步港美股基础信息失败:%s", err.Error())
+		return
+	}
+	logger.SugaredLogger.Infof("通达信同步港美股基础信息完成：港股新增 %d 更新 %d，美股新增 %d 更新 %d",
+		hkAdded, hkUpdated, usAdded, usUpdated)
 }
 func (a *App) NewsPush(news *[]models.Telegraph) {
 
@@ -794,23 +1078,24 @@ func (a *App) AddCronTask(follow data.FollowedStock) func() {
 	return func() {
 		go runtime.EventsEmit(a.ctx, "warnMsg", "开始自动分析"+follow.Name+"_"+follow.StockCode)
 		ai := data.NewDeepSeekOpenAi(a.ctx, follow.AiConfigId)
-		msgs := ai.NewChatStream(follow.Name, follow.StockCode, "", nil, a.AiTools, true)
+		thinking := data.GetSettingConfig().GetAIConfigThinking(follow.AiConfigId)
+		msgs := ai.NewChatStream(follow.Name, follow.StockCode, "", nil, a.AiTools, thinking)
 		var res strings.Builder
 
 		chatId := ""
 		question := ""
 		for msg := range msgs {
-			if msg["extraContent"] != nil {
-				res.WriteString(msg["extraContent"].(string) + "\n")
+			if v, ok := msg["extraContent"].(string); ok && v != "" {
+				res.WriteString(v + "\n")
 			}
-			if msg["content"] != nil {
-				res.WriteString(msg["content"].(string))
+			if v, ok := msg["content"].(string); ok && v != "" {
+				res.WriteString(v)
 			}
-			if msg["chatId"] != nil {
-				chatId = msg["chatId"].(string)
+			if v, ok := msg["chatId"].(string); ok {
+				chatId = v
 			}
-			if msg["question"] != nil {
-				question = msg["question"].(string)
+			if v, ok := msg["question"].(string); ok {
+				question = v
 			}
 		}
 
@@ -821,37 +1106,123 @@ func (a *App) AddCronTask(follow data.FollowedStock) func() {
 }
 
 func refreshTelegraphList() *[]string {
-	url := "https://www.cls.cn/telegraph"
-	response, err := resty.New().R().
+	clsURL := "https://www.cls.cn/api/cache?app=CailianpressWeb&name=telegraph&os=web&sv=8.7.9"
+	response, err := data.SharedHTTPClient.R().
 		SetHeader("Referer", "https://www.cls.cn/").
-		SetHeader("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117.0.0.0 Safari/537.36 Edg/117.0.2045.60").
-		Get(url)
+		SetHeader("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0").
+		Get(clsURL)
 	if err != nil {
 		return &[]string{}
 	}
-	//logger.SugaredLogger.Info(string(response.Body()))
-	document, err := goquery.NewDocumentFromReader(strings.NewReader(string(response.Body())))
-	if err != nil {
+	res := map[string]any{}
+	if err := json.Unmarshal(response.Body(), &res); err != nil {
 		return &[]string{}
 	}
 	var telegraph []string
-	document.Find("div.telegraph-content-box").Each(func(i int, selection *goquery.Selection) {
-		//logger.SugaredLogger.Info(selection.Text())
-		telegraph = append(telegraph, selection.Text())
-	})
+	if v, _ := convertor.ToInt(res["errno"]); v == 0 {
+		if res["data"] == nil {
+			return &[]string{}
+		}
+		dataMap, ok := res["data"].(map[string]any)
+		if !ok {
+			return &[]string{}
+		}
+		rollData, ok := dataMap["roll_data"].([]any)
+		if !ok {
+			return &[]string{}
+		}
+		for _, v := range rollData {
+			news, ok := v.(map[string]any)
+			if !ok {
+				continue
+			}
+			content, _ := news["content"].(string)
+			if content != "" {
+				telegraph = append(telegraph, content)
+			}
+		}
+	}
 	return &telegraph
 }
 
 // isTradingDay 判断是否是交易日
+var tradingDayCache = freecache.NewCache(64 * 1024)
+
 func isTradingDay(date time.Time) bool {
 	weekday := date.Weekday()
-	// 判断是否是周末
+	dateStr := date.Format("2006-01-02")
+
+	cacheKey := []byte(dateStr)
+	if cached, err := tradingDayCache.Get(cacheKey); err == nil {
+		return string(cached) == "1"
+	}
+
 	if weekday == time.Saturday || weekday == time.Sunday {
+		_ = tradingDayCache.Set(cacheKey, []byte("0"), 86400)
 		return false
 	}
-	// 这里可以添加具体的节假日判断逻辑
-	// 例如：判断是否是春节、国庆节等
+
+	isHoliday, apiOk := checkHolidayAPI(dateStr)
+	if apiOk {
+		if isHoliday {
+			_ = tradingDayCache.Set(cacheKey, []byte("0"), 86400)
+			return false
+		}
+		_ = tradingDayCache.Set(cacheKey, []byte("1"), 86400)
+		return true
+	}
+
+	_ = tradingDayCache.Set(cacheKey, []byte("1"), 600)
 	return true
+}
+
+func checkHolidayAPI(date string) (isHoliday bool, apiOk bool) {
+	type holidayResp struct {
+		Code    int `json:"code"`
+		Holiday struct {
+			Holiday bool   `json:"holiday"`
+			Name    string `json:"name"`
+		} `json:"holiday"`
+	}
+	var result holidayResp
+	resp, err := data.SharedHTTPClient.R().SetResult(&result).Get(fmt.Sprintf("https://timor.tech/api/holiday/info/%s", date))
+	if err != nil || resp.StatusCode() != 200 {
+		return false, false
+	}
+	if result.Code == 0 && result.Holiday.Holiday {
+		return true, true
+	}
+	return false, true
+}
+
+func preCacheTradingDays() {
+	loc, err := time.LoadLocation("Asia/Shanghai")
+	if err != nil {
+		loc = ShanghaiTimezone
+	}
+	now := time.Now().In(loc)
+	go func() {
+		for i := -7; i <= 7; i++ {
+			d := now.AddDate(0, 0, i)
+			isTradingDay(d)
+		}
+	}()
+	go func() {
+		for i := -7; i <= 7; i++ {
+			d := now.AddDate(0, 0, i)
+			isHKTradingDay(d)
+		}
+	}()
+	go func() {
+		est, _ := time.LoadLocation("America/New_York")
+		for i := -7; i <= 7; i++ {
+			d := now.AddDate(0, 0, i)
+			if est != nil {
+				d = d.In(est)
+			}
+			isUSTradingDay(d)
+		}
+	}()
 }
 
 // isTradingTime 判断是否是交易时间
@@ -877,69 +1248,160 @@ func isTradingTime(date time.Time) bool {
 
 // IsHKTradingTime 判断当前时间是否在港股交易时间内
 func IsHKTradingTime(date time.Time) bool {
+	if !isHKTradingDay(date) {
+		return false
+	}
+
 	hour, minute, _ := date.Clock()
 
-	// 开市前竞价时段：09:00 - 09:30
 	if (hour == 9 && minute >= 0) || (hour == 9 && minute <= 30) {
 		return true
 	}
 
-	// 上午持续交易时段：09:30 - 12:00
 	if (hour == 9 && minute > 30) || (hour >= 10 && hour < 12) || (hour == 12 && minute == 0) {
 		return true
 	}
 
-	// 下午持续交易时段：13:00 - 16:00
 	if (hour == 13 && minute >= 0) || (hour >= 14 && hour < 16) || (hour == 16 && minute == 0) {
 		return true
 	}
 
-	// 收市竞价交易时段：16:00 - 16:10
 	if (hour == 16 && minute >= 0) || (hour == 16 && minute <= 10) {
 		return true
 	}
 	return false
 }
 
+func isHKTradingDay(date time.Time) bool {
+	weekday := date.Weekday()
+	dateStr := date.Format("2006-01-02")
+
+	cacheKey := []byte("hk:" + dateStr)
+	if cached, err := tradingDayCache.Get(cacheKey); err == nil {
+		return string(cached) == "1"
+	}
+
+	if weekday == time.Saturday || weekday == time.Sunday {
+		_ = tradingDayCache.Set(cacheKey, []byte("0"), 86400)
+		return false
+	}
+
+	isHoliday, apiOk := checkHKHolidayAPI(dateStr)
+	if apiOk {
+		if isHoliday {
+			_ = tradingDayCache.Set(cacheKey, []byte("0"), 86400)
+			return false
+		}
+		_ = tradingDayCache.Set(cacheKey, []byte("1"), 86400)
+		return true
+	}
+
+	_ = tradingDayCache.Set(cacheKey, []byte("1"), 600)
+	return true
+}
+
+func checkHKHolidayAPI(date string) (isHoliday bool, apiOk bool) {
+	type klineResp struct {
+		Data struct {
+			Klines []string `json:"klines"`
+		} `json:"data"`
+	}
+	var result klineResp
+	dateClean := strings.ReplaceAll(date, "-", "")
+	apiURL := fmt.Sprintf("https://push2his.eastmoney.com/api/qt/stock/kline/get?secid=100.HSI&fields1=f1&fields2=f51&klt=101&fqt=0&beg=%s&end=%s", dateClean, dateClean)
+	resp, err := data.SharedHTTPClient.R().SetResult(&result).Get(apiURL)
+	if err != nil || resp.StatusCode() != 200 {
+		return false, false
+	}
+	if result.Data.Klines != nil && len(result.Data.Klines) > 0 {
+		return false, true
+	}
+	return true, true
+}
+
 // IsUSTradingTime 判断当前时间是否在美股交易时间内
 func IsUSTradingTime(date time.Time) bool {
-	// 获取美国东部时区
 	est, err := time.LoadLocation("America/New_York")
 	var estTime time.Time
 	if err != nil {
 		estTime = date.Add(time.Hour * -12)
 	} else {
-		// 将当前时间转换为美国东部时间
 		estTime = date.In(est)
 	}
 
-	// 判断是否是周末
-	weekday := estTime.Weekday()
-	if weekday == time.Saturday || weekday == time.Sunday {
+	if !isUSTradingDay(estTime) {
 		return false
 	}
 
-	// 获取小时和分钟
 	hour, minute, _ := estTime.Clock()
 
-	// 判断是否在4:00 AM到9:30 AM之间（盘前）
 	if (hour == 4) || (hour == 5) || (hour == 6) || (hour == 7) || (hour == 8) || (hour == 9 && minute < 30) {
 		return true
 	}
 
-	// 判断是否在9:30 AM到4:00 PM之间（盘中）
 	if (hour == 9 && minute >= 30) || (hour >= 10 && hour < 16) || (hour == 16 && minute == 0) {
 		return true
 	}
 
-	// 判断是否在4:00 PM到8:00 PM之间（盘后）
 	if (hour == 16 && minute > 0) || (hour >= 17 && hour < 20) || (hour == 20 && minute == 0) {
 		return true
 	}
 
 	return false
 }
+
+func isUSTradingDay(estTime time.Time) bool {
+	weekday := estTime.Weekday()
+	dateStr := estTime.Format("2006-01-02")
+
+	cacheKey := []byte("us:" + dateStr)
+	if cached, err := tradingDayCache.Get(cacheKey); err == nil {
+		return string(cached) == "1"
+	}
+
+	if weekday == time.Saturday || weekday == time.Sunday {
+		_ = tradingDayCache.Set(cacheKey, []byte("0"), 86400)
+		return false
+	}
+
+	isHoliday, apiOk := checkUSHolidayAPI(dateStr)
+	if apiOk {
+		if isHoliday {
+			_ = tradingDayCache.Set(cacheKey, []byte("0"), 86400)
+			return false
+		}
+		_ = tradingDayCache.Set(cacheKey, []byte("1"), 86400)
+		return true
+	}
+
+	_ = tradingDayCache.Set(cacheKey, []byte("1"), 600)
+	return true
+}
+
+func checkUSHolidayAPI(date string) (isHoliday bool, apiOk bool) {
+	type usHolidayResp struct {
+		IsHoliday    bool   `json:"is_holiday"`
+		IsEarlyClose bool   `json:"is_early_close"`
+		IsWeekend    bool   `json:"is_weekend"`
+		Status       string `json:"status"`
+	}
+	var result usHolidayResp
+	apiURL := fmt.Sprintf("https://fincalapi.com/v1/day_status?calendar=NYSE&date=%s", date)
+	resp, err := data.SharedHTTPClient.R().SetResult(&result).Get(apiURL)
+	if err != nil || resp.StatusCode() != 200 {
+		return false, false
+	}
+	return result.IsHoliday, true
+}
 func MonitorFundPrices(a *App) {
+	// 检查 A 股是否开市（基金交易时间与 A 股一致）
+	if !isTradingTime(time.Now()) {
+		logger.SugaredLogger.Debugf("当前 A 股未开市，跳过基金价格监控")
+		return
+	}
+
+	logger.SugaredLogger.Debugf("A 股市场已开市，开始基金价格监控")
+
 	dest := &[]data.FollowedFund{}
 	db.Dao.Model(&data.FollowedFund{}).Find(dest)
 	for _, follow := range *dest {
@@ -951,6 +1413,280 @@ func MonitorFundPrices(a *App) {
 		data.NewFundApi().CrawlFundNetEstimatedUnit(follow.Code)
 		data.NewFundApi().CrawlFundNetUnitValue(follow.Code)
 	}
+}
+
+// MonitorAiRecommendStockPrices 监控 AI 推荐股票的价格，当股价达到预警线时发送通知
+func MonitorAiRecommendStockPrices(a *App) {
+	isAStockOpen := isTradingTime(time.Now())
+	isHKStockOpen := IsHKTradingTime(time.Now())
+	isUSStockOpen := IsUSTradingTime(time.Now())
+
+	if !isAStockOpen && !isHKStockOpen && !isUSStockOpen {
+		logger.SugaredLogger.Debugf("当前所有市场均未开市，跳过 AI 推荐股票价格监控")
+		return
+	}
+
+	var aiRecommendStocks []models.AiRecommendStocks
+	db.Dao.Model(&models.AiRecommendStocks{}).Where("enable_alert = ?", true).Find(&aiRecommendStocks)
+
+	if len(aiRecommendStocks) == 0 {
+		return
+	}
+
+	stockCodes := make([]string, 0)
+	stockCodeMap := make(map[string]*models.AiRecommendStocks)
+	for i := range aiRecommendStocks {
+		stock := &aiRecommendStocks[i]
+		stopLossPrice, _ := convertor.ToFloat(stock.RecommendStopLossPrice)
+		if stock.RecommendBuyPriceMin <= 0 && stock.RecommendStopProfitPriceMin <= 0 && stopLossPrice <= 0 {
+			continue
+		}
+		stockCodes = append(stockCodes, tools.GetStockCode(stock.StockCode))
+		stockCodeMap[tools.GetStockCode(stock.StockCode)] = stock
+	}
+
+	if len(stockCodes) == 0 {
+		logger.SugaredLogger.Debugf("没有设置预警价格的 AI 推荐股票，跳过价格监控")
+		return
+	}
+
+	stockData, err := data.NewStockDataApi().GetStockCodeRealTimeData(stockCodes...)
+	if err != nil || stockData == nil || len(*stockData) == 0 {
+		logger.SugaredLogger.Errorf("获取 AI 推荐股票实时数据失败: %v", err)
+		return
+	}
+
+	for _, stockInfo := range *stockData {
+		aiStock, ok := stockCodeMap[tools.GetStockCode(stockInfo.Code)]
+		if !ok {
+			continue
+		}
+
+		currentPrice, _ := convertor.ToFloat(stockInfo.Price)
+		if currentPrice <= 0 {
+			continue
+		}
+
+		baseAlertKey := fmt.Sprintf("%s:%s", aiStock.StockCode, aiStock.DataTime.Format("20060102"))
+
+		buyAlertKey := baseAlertKey + ":BUY"
+		if aiStock.RecommendBuyPriceMin > 0 && currentPrice <= aiStock.RecommendBuyPriceMin {
+			priceSinceLastBuyAlert := a.getPriceAtAlertReset(buyAlertKey)
+			if priceSinceLastBuyAlert == 0 || priceSinceLastBuyAlert > aiStock.RecommendBuyPriceMin {
+				title := fmt.Sprintf("【买入预警】%s", aiStock.StockName)
+				content := fmt.Sprintf("## %s\n\n- **股票代码**: %s\n- **当前价格**: %.2f\n- **建议买入价**: %.2f - %.2f\n- **推荐时间**: %s",
+					aiStock.StockName, aiStock.StockCode, currentPrice, aiStock.RecommendBuyPriceMin, aiStock.RecommendBuyPriceMax,
+					aiStock.DataTime.Format("2006-01-02 15:04:05"))
+				plainContent := fmt.Sprintf("%s(%s)\n当前价格: %.2f\n建议买入价: %.2f-%.2f",
+					aiStock.StockName, aiStock.StockCode, currentPrice, aiStock.RecommendBuyPriceMin, aiStock.RecommendBuyPriceMax)
+				if a.canSendAlert(buyAlertKey, 5*time.Minute) {
+					go data.NewAlertWindowsApi("go-stock价格预警", title, content, "").SendNotification()
+					go data.NewDingDingAPI().SendToDingDing(title, content)
+					go runtime.EventsEmit(a.ctx, "newsPush", map[string]any{
+						"time":    title,
+						"isRed":   true,
+						"source":  "go-stock",
+						"content": plainContent,
+					})
+					a.updateAlertSentTime(buyAlertKey)
+					a.updatePriceAtAlertReset(buyAlertKey, currentPrice)
+				}
+			} else {
+				a.updatePriceAtAlertReset(buyAlertKey, currentPrice)
+			}
+		} else {
+			priceSinceLastBuyAlert := a.getPriceAtAlertReset(buyAlertKey)
+			if currentPrice > aiStock.RecommendBuyPriceMin && (priceSinceLastBuyAlert == 0 || currentPrice > priceSinceLastBuyAlert) {
+				a.updatePriceAtAlertReset(buyAlertKey, currentPrice)
+			}
+		}
+
+		profitAlertKey := baseAlertKey + ":PROFIT"
+		if aiStock.RecommendStopProfitPriceMin > 0 && currentPrice >= aiStock.RecommendStopProfitPriceMin {
+			priceSinceLastProfitAlert := a.getPriceAtAlertReset(profitAlertKey)
+			if priceSinceLastProfitAlert == 0 || priceSinceLastProfitAlert < aiStock.RecommendStopProfitPriceMin {
+				title := fmt.Sprintf("【止盈预警】%s", aiStock.StockName)
+				content := fmt.Sprintf("## %s\n\n- **股票代码**: %s\n- **当前价格**: %.2f\n- **建议止盈价**: %.2f - %.2f\n- **推荐时间**: %s",
+					aiStock.StockName, aiStock.StockCode, currentPrice, aiStock.RecommendStopProfitPriceMin, aiStock.RecommendStopProfitPriceMax,
+					aiStock.DataTime.Format("2006-01-02 15:04:05"))
+				plainContent := fmt.Sprintf("%s(%s)\n当前价格: %.2f\n建议止盈价: %.2f-%.2f",
+					aiStock.StockName, aiStock.StockCode, currentPrice, aiStock.RecommendStopProfitPriceMin, aiStock.RecommendStopProfitPriceMax)
+				if a.canSendAlert(profitAlertKey, 5*time.Minute) {
+					go data.NewAlertWindowsApi("go-stock价格预警", title, content, "").SendNotification()
+					go data.NewDingDingAPI().SendToDingDing(title, content)
+					go runtime.EventsEmit(a.ctx, "newsPush", map[string]any{
+						"time":    title,
+						"isRed":   true,
+						"source":  "go-stock",
+						"content": plainContent,
+					})
+					a.updateAlertSentTime(profitAlertKey)
+					a.updatePriceAtAlertReset(profitAlertKey, currentPrice)
+				}
+			} else {
+				a.updatePriceAtAlertReset(profitAlertKey, currentPrice)
+			}
+		} else {
+			priceSinceLastProfitAlert := a.getPriceAtAlertReset(profitAlertKey)
+			if currentPrice < aiStock.RecommendStopProfitPriceMin && (priceSinceLastProfitAlert == 0 || currentPrice < priceSinceLastProfitAlert) {
+				a.updatePriceAtAlertReset(profitAlertKey, currentPrice)
+			}
+		}
+
+		stopLossAlertKey := baseAlertKey + ":LOSS"
+		stopLossPrice, _ := convertor.ToFloat(aiStock.RecommendStopLossPrice)
+		if stopLossPrice > 0 && currentPrice <= stopLossPrice {
+			priceSinceLastLossAlert := a.getPriceAtAlertReset(stopLossAlertKey)
+			if priceSinceLastLossAlert == 0 || priceSinceLastLossAlert > stopLossPrice {
+				title := fmt.Sprintf("【止损预警】%s", aiStock.StockName)
+				content := fmt.Sprintf("## %s\n\n- **股票代码**: %s\n- **当前价格**: %.2f\n- **建议止损价**: %s\n- **推荐时间**: %s",
+					aiStock.StockName, aiStock.StockCode, currentPrice, aiStock.RecommendStopLossPrice,
+					aiStock.DataTime.Format("2006-01-02 15:04:05"))
+				plainContent := fmt.Sprintf("%s(%s)\n当前价格: %.2f\n建议止损价: %s",
+					aiStock.StockName, aiStock.StockCode, currentPrice, aiStock.RecommendStopLossPrice)
+				if a.canSendAlert(stopLossAlertKey, 5*time.Minute) {
+					go data.NewAlertWindowsApi("go-stock价格预警", title, content, "").SendNotification()
+					go data.NewDingDingAPI().SendToDingDing(title, content)
+					go runtime.EventsEmit(a.ctx, "newsPush", map[string]any{
+						"time":    title,
+						"isRed":   true,
+						"source":  "go-stock",
+						"content": plainContent,
+					})
+					a.updateAlertSentTime(stopLossAlertKey)
+					a.updatePriceAtAlertReset(stopLossAlertKey, currentPrice)
+				}
+			} else {
+				a.updatePriceAtAlertReset(stopLossAlertKey, currentPrice)
+			}
+		} else {
+			priceSinceLastLossAlert := a.getPriceAtAlertReset(stopLossAlertKey)
+			if currentPrice > stopLossPrice && (priceSinceLastLossAlert == 0 || currentPrice > priceSinceLastLossAlert) {
+				a.updatePriceAtAlertReset(stopLossAlertKey, currentPrice)
+			}
+		}
+	}
+}
+
+// MonitorFollowedStockCostPrices 监控自选股的持仓成本价，当股价低于成本价时发送预警
+func MonitorFollowedStockCostPrices(a *App) {
+	isAStockOpen := isTradingTime(time.Now())
+	isHKStockOpen := IsHKTradingTime(time.Now())
+	isUSStockOpen := IsUSTradingTime(time.Now())
+
+	if !isAStockOpen && !isHKStockOpen && !isUSStockOpen {
+		logger.SugaredLogger.Debugf("当前所有市场均未开市，跳过自选股成本价监控")
+		return
+	}
+
+	var followedStocks []data.FollowedStock
+	db.Dao.Model(&data.FollowedStock{}).Where("cost_price > 0").Find(&followedStocks)
+
+	if len(followedStocks) == 0 {
+		return
+	}
+
+	stockCodes := make([]string, 0)
+	stockMap := make(map[string]*data.FollowedStock)
+	for i := range followedStocks {
+		stock := &followedStocks[i]
+		stockCodes = append(stockCodes, tools.GetStockCode(stock.StockCode))
+		stockMap[tools.GetStockCode(stock.StockCode)] = stock
+	}
+
+	stockData, err := data.NewStockDataApi().GetStockCodeRealTimeData(stockCodes...)
+	if err != nil || stockData == nil || len(*stockData) == 0 {
+		logger.SugaredLogger.Errorf("获取自选股实时数据失败: %v", err)
+		return
+	}
+
+	for _, stockInfo := range *stockData {
+		followedStock, ok := stockMap[tools.GetStockCode(stockInfo.Code)]
+		if !ok {
+			continue
+		}
+
+		currentPrice, _ := convertor.ToFloat(stockInfo.Price)
+		if currentPrice <= 0 {
+			continue
+		}
+
+		costPrice := followedStock.CostPrice
+		if costPrice <= 0 {
+			continue
+		}
+
+		alertKey := fmt.Sprintf("COST:%s:%s", followedStock.StockCode, followedStock.Time.Format("20060102"))
+
+		if currentPrice < costPrice {
+			priceSinceLastAlert := a.getPriceAtAlertReset(alertKey)
+			if priceSinceLastAlert == 0 || priceSinceLastAlert >= costPrice {
+				dropPercent := ((costPrice - currentPrice) / costPrice) * 100
+				title := fmt.Sprintf("【成本价预警】%s", followedStock.Name)
+				content := fmt.Sprintf("## %s\n\n- **股票代码**: %s\n- **当前价格**: %.2f\n- **持仓成本价**: %.2f\n- **亏损比例**: %.2f%%\n- **关注时间**: %s",
+					followedStock.Name, followedStock.StockCode, currentPrice, costPrice, dropPercent,
+					followedStock.Time.Format("2006-01-02 15:04:05"))
+				plainContent := fmt.Sprintf("%s(%s)\n当前价格: %.2f\n成本价: %.2f\n亏损: %.2f%%",
+					followedStock.Name, followedStock.StockCode, currentPrice, costPrice, dropPercent)
+				if a.canSendAlert(alertKey, 5*time.Minute) {
+					go data.NewAlertWindowsApi("go-stock价格预警", title, content, "").SendNotification()
+					go data.NewDingDingAPI().SendToDingDing(title, content)
+					go runtime.EventsEmit(a.ctx, "newsPush", map[string]any{
+						"time":    title,
+						"isRed":   true,
+						"source":  "go-stock",
+						"content": plainContent,
+					})
+					a.updateAlertSentTime(alertKey)
+					a.updatePriceAtAlertReset(alertKey, currentPrice)
+				}
+			} else {
+				a.updatePriceAtAlertReset(alertKey, currentPrice)
+			}
+		} else {
+			priceSinceLastAlert := a.getPriceAtAlertReset(alertKey)
+			if currentPrice >= costPrice && (priceSinceLastAlert == 0 || currentPrice < priceSinceLastAlert) {
+				a.updatePriceAtAlertReset(alertKey, currentPrice)
+			}
+		}
+	}
+}
+
+// canSendAlert 检查是否可以发送预警，避免重复发送
+// alertKey: 预警的唯一标识
+// interval: 发送间隔
+// 返回 true 表示可以发送，false 表示需要在间隔后才能发送
+func (a *App) canSendAlert(alertKey string, interval time.Duration) bool {
+	a.stockAlertMu.Lock()
+	defer a.stockAlertMu.Unlock()
+
+	lastSent, exists := a.stockAlertLastSent[alertKey]
+	if !exists {
+		return true
+	}
+
+	return time.Since(lastSent) >= interval
+}
+
+// updateAlertSentTime 更新预警发送时间
+func (a *App) updateAlertSentTime(alertKey string) {
+	a.stockAlertMu.Lock()
+	defer a.stockAlertMu.Unlock()
+	a.stockAlertLastSent[alertKey] = time.Now()
+}
+
+// getPriceAtAlertReset 获取预警重置后的价格（用于判断是否需要重新触发预警）
+func (a *App) getPriceAtAlertReset(alertKey string) float64 {
+	a.stockAlertMu.Lock()
+	defer a.stockAlertMu.Unlock()
+	return a.priceAtAlertReset[alertKey]
+}
+
+// updatePriceAtAlertReset 更新预警重置后的价格
+func (a *App) updatePriceAtAlertReset(alertKey string, price float64) {
+	a.stockAlertMu.Lock()
+	defer a.stockAlertMu.Unlock()
+	a.priceAtAlertReset[alertKey] = price
 }
 
 func GetStockInfos(follows ...data.FollowedStock) *[]data.StockInfo {
@@ -968,7 +1704,10 @@ func GetStockInfos(follows ...data.FollowedStock) *[]data.StockInfo {
 		}
 		stockCodes = append(stockCodes, follow.StockCode)
 	}
-	stockData, _ := data.NewStockDataApi().GetStockCodeRealTimeData(stockCodes...)
+	stockData, err := data.NewStockDataApi().GetStockCodeRealTimeData(stockCodes...)
+	if err != nil || stockData == nil {
+		return &stockInfos
+	}
 	for _, info := range *stockData {
 		v, ok := slice.FindBy(follows, func(idx int, follow data.FollowedStock) bool {
 			if strutil.HasPrefixAny(follow.StockCode, []string{"US", "us"}) {
@@ -987,7 +1726,7 @@ func GetStockInfos(follows ...data.FollowedStock) *[]data.StockInfo {
 func getStockInfo(follow data.FollowedStock) *data.StockInfo {
 	stockCode := follow.StockCode
 	stockDatas, err := data.NewStockDataApi().GetStockCodeRealTimeData(stockCode)
-	if err != nil || len(*stockDatas) == 0 {
+	if err != nil || stockDatas == nil || len(*stockDatas) == 0 {
 		return &data.StockInfo{}
 	}
 	stockData := (*stockDatas)[0]
@@ -1073,9 +1812,17 @@ func addStockFollowData(follow data.FollowedStock, stockData *data.StockInfo) {
 // shutdown is called at application termination
 func (a *App) shutdown(ctx context.Context) {
 	defer PanicHandler()
-	// Perform your teardown here
-	//os.Exit(0)
-	logger.SugaredLogger.Infof("application shutdown Version:%s", Version)
+	// 记录当前窗口大小，供下次启动时还原
+	if a.ctx != nil {
+		if w, h := runtime.WindowGetSize(a.ctx); w > 0 && h > 0 {
+			cfg := data.GetSettingConfig()
+			cfg.WindowWidth = w
+			cfg.WindowHeight = h
+			data.UpdateConfig(cfg)
+			//logger.SugaredLogger.Infof("save window size: %dx%d", w, h)
+		}
+	}
+	//logger.SugaredLogger.Infof("application shutdown Version:%s", Version)
 }
 
 // Greet returns a greeting for the given name
@@ -1110,6 +1857,10 @@ func (a *App) SetCostPriceAndVolume(stockCode string, price float64, volume int6
 	return data.NewStockDataApi().SetCostPriceAndVolume(price, volume, stockCode)
 }
 
+func (a *App) SetTradingPrice(stockCode string, entryPrice, takeProfitPrice, stopLossPrice, costPrice float64) string {
+	return data.NewStockDataApi().SetTradingPrice(entryPrice, takeProfitPrice, stopLossPrice, costPrice, stockCode)
+}
+
 func (a *App) SetAlarmChangePercent(val, alarmPrice float64, stockCode string) string {
 	return data.NewStockDataApi().SetAlarmChangePercent(val, alarmPrice, stockCode)
 }
@@ -1118,7 +1869,7 @@ func (a *App) SetStockSort(sort int64, stockCode string) {
 }
 func (a *App) SendDingDingMessage(message string, stockCode string) string {
 	ttl, _ := a.cache.TTL([]byte(stockCode))
-	logger.SugaredLogger.Infof("stockCode %s ttl:%d", stockCode, ttl)
+	//logger.SugaredLogger.Infof("stockCode %s ttl:%d", stockCode, ttl)
 	if ttl > 0 {
 		return ""
 	}
@@ -1144,7 +1895,6 @@ func (a *App) SendDingDingMessageByType(message string, stockCode string, msgTyp
 	}
 
 	ttl, _ := a.cache.TTL([]byte(stockCode))
-	//logger.SugaredLogger.Infof("stockCode %s ttl:%d", stockCode, ttl)
 	if ttl > 0 {
 		return ""
 	}
@@ -1156,10 +1906,28 @@ func (a *App) SendDingDingMessageByType(message string, stockCode string, msgTyp
 	stockInfo := &data.StockInfo{}
 	db.Dao.Model(stockInfo).Where("code = ?", stockCode).First(stockInfo)
 	go data.NewAlertWindowsApi("go-stock消息通知", getMsgTypeName(msgType), GenNotificationMsg(stockInfo), "").SendNotification()
+
+	go runtime.EventsEmit(a.ctx, "newsPush", map[string]any{
+		"time":    "📈 " + getMsgTypeName(msgType),
+		"isRed":   true,
+		"source":  "go-stock",
+		"content": GenNotificationMsg(stockInfo),
+	})
+
 	return data.NewDingDingAPI().SendDingDingMessage(message)
 }
 
 func (a *App) NewChatStream(stock, stockCode, question string, aiConfigId int, sysPromptId *int, enableTools bool, think bool) {
+	defer func() {
+		if err := recover(); err != nil {
+			logger.SugaredLogger.Errorf("NewChatStream panic: %v", err)
+			runtime.EventsEmit(a.ctx, "newChatStream", map[string]any{
+				"code":    0,
+				"content": fmt.Sprintf("AI分析异常: %v", err),
+			})
+			runtime.EventsEmit(a.ctx, "newChatStream", "DONE")
+		}
+	}()
 	var msgs <-chan map[string]any
 	if enableTools {
 		msgs = data.NewDeepSeekOpenAi(a.ctx, aiConfigId).NewChatStream(stock, stockCode, question, sysPromptId, a.AiTools, think)
@@ -1189,6 +1957,10 @@ func (a *App) GetVersionInfo() *models.VersionInfo {
 		Content:           VersionCommit,
 		OfficialStatement: OFFICIAL_STATEMENT,
 	}
+}
+
+func (a *App) GetUserManual() string {
+	return string(userManual)
 }
 
 //// checkChromeOnWindows 在 Windows 系统上检查谷歌浏览器是否安装
@@ -1247,7 +2019,7 @@ func GenNotificationMsg(stockInfo *data.StockInfo) string {
 	return "[" + stockInfo.Name + "] " + stockInfo.Price + " " + convertor.ToString(RF) + "% " + stockInfo.Date + " " + stockInfo.Time
 }
 
-// msgType : 1 涨跌报警(5分钟);2 股价报警(30分钟) 3 成本价报警(30分钟)
+// msgType : 1 涨跌报警(5分钟);2 股价报警(30分钟) 3 成本价报警(30分钟) 4 止盈报警(5分钟) 5 止损报警(5分钟)
 func getMsgTypeTTL(msgType int) int {
 	switch msgType {
 	case 1:
@@ -1256,6 +2028,10 @@ func getMsgTypeTTL(msgType int) int {
 		return 60 * 30
 	case 3:
 		return 60 * 30
+	case 4:
+		return 60 * 5
+	case 5:
+		return 60 * 5
 	default:
 		return 60 * 5
 	}
@@ -1269,6 +2045,10 @@ func getMsgTypeName(msgType int) string {
 		return "股价报警"
 	case 3:
 		return "成本价报警"
+	case 4:
+		return "止盈报警"
+	case 5:
+		return "止损报警"
 	default:
 		return "未知类型"
 	}
@@ -1276,23 +2056,22 @@ func getMsgTypeName(msgType int) string {
 
 func onExit(a *App) {
 	// 清理操作
-	logger.SugaredLogger.Infof("systray onExit")
+	//logger.SugaredLogger.Infof("systray onExit")
 	//systray.Quit()
 	//runtime.Quit(a.ctx)
 }
 
 func (a *App) UpdateConfig(settingConfig *data.SettingConfig) string {
-	s1, _ := json.Marshal(settingConfig)
-	logger.SugaredLogger.Infof("UpdateConfig:%s", s1)
+	//s1, _ := json.Marshal(settingConfig)
+	//logger.SugaredLogger.Infof("UpdateConfig:%s", s1)
 	if settingConfig.RefreshInterval > 0 {
-		if entryID, exists := a.cronEntrys["MonitorStockPrices"]; exists {
+		if entryID, exists := a.getCronEntry("MonitorStockPrices"); exists {
 			a.cron.Remove(entryID)
 		}
 		id, _ := a.cron.AddFunc(fmt.Sprintf("@every %ds", settingConfig.RefreshInterval), func() {
-			//logger.SugaredLogger.Infof("MonitorStockPrices:%s", time.Now())
 			MonitorStockPrices(a)
 		})
-		a.cronEntrys["MonitorStockPrices"] = id
+		a.setCronEntry("MonitorStockPrices", id)
 	}
 
 	return data.UpdateConfig(settingConfig)
@@ -1326,8 +2105,8 @@ func (a *App) ShareAnalysis(stockCode, stockName string) string {
 	res := data.NewDeepSeekOpenAi(a.ctx, 0).GetAIResponseResult(stockCode)
 	if res != nil && len(res.Content) > 100 {
 		analysisTime := res.CreatedAt.Format("2006/01/02")
-		logger.SugaredLogger.Infof("%s analysisTime:%s", res.CreatedAt, analysisTime)
-		response, err := resty.New().SetHeader("ua-x", "go-stock").R().SetFormData(map[string]string{
+		//logger.SugaredLogger.Infof("%s analysisTime:%s", res.CreatedAt, analysisTime)
+		response, err := data.SharedHTTPClient.R().SetHeader("ua-x", "go-stock").SetFormData(map[string]string{
 			"text":         res.Content,
 			"stockCode":    stockCode,
 			"stockName":    stockName,
@@ -1342,6 +2121,29 @@ func (a *App) ShareAnalysis(stockCode, stockName string) string {
 	}
 }
 
+// ShareText 直接把文本分享到社区（用于 AI 助手等非 AIResponseResult 场景）
+func (a *App) ShareText(text, title string) string {
+	text = strings.TrimSpace(text)
+	title = strings.TrimSpace(title)
+	if text == "" {
+		return "内容为空"
+	}
+	if title == "" {
+		title = "AI助手"
+	}
+	analysisTime := time.Now().Format("2006/01/02")
+	response, err := data.SharedHTTPClient.R().SetHeader("ua-x", "go-stock").SetFormData(map[string]string{
+		"text":         text,
+		"stockCode":    title,
+		"stockName":    title,
+		"analysisTime": analysisTime,
+	}).Post("http://go-stock.sparkmemory.top:16688/upload")
+	if err != nil {
+		return err.Error()
+	}
+	return response.String()
+}
+
 func (a *App) GetfundList(key string) []data.FundBasic {
 	return data.NewFundApi().GetFundList(key)
 }
@@ -1353,6 +2155,36 @@ func (a *App) FollowFund(fundCode string) string {
 }
 func (a *App) UnFollowFund(fundCode string) string {
 	return data.NewFundApi().UnFollowFund(fundCode)
+}
+func (a *App) GetFundKLine(fundCode string, klt string, limit int) *data.KLineSourceResult {
+	return data.NewFundKLineApi().GetFundKLineWithFallback(fundCode, klt, limit)
+}
+func (a *App) GetFundHistoryNetValue(fundCode string, pageSize int, startDate string, endDate string) []data.FundHistoryNetValue {
+	res, _ := data.NewFundApi().GetFundHistoryNetValue(fundCode, 1, pageSize, startDate, endDate)
+	if res == nil {
+		return []data.FundHistoryNetValue{}
+	}
+	return res
+}
+func (a *App) GetFundTop10Holdings(fundCode string) []data.FundHoldingStock {
+	res, err := data.NewFundApi().GetFundTop10Holdings(fundCode)
+	if err != nil || res == nil {
+		return []data.FundHoldingStock{}
+	}
+	return res
+}
+func (a *App) GetFundRanking(marketType, fundType, sortField, sortOrder string, pageIndex, pageSize int) *data.FundRankingResult {
+	res, err := data.NewFundApi().GetFundRanking(marketType, fundType, sortField, sortOrder, pageIndex, pageSize)
+	if err != nil || res == nil {
+		return &data.FundRankingResult{}
+	}
+	return res
+}
+func (a *App) SearchFundCodes(keyword string) []data.FundSearchItem {
+	return data.NewFundApi().SearchFundCodes(keyword)
+}
+func (a *App) GetFollowedFundPaged(pageIndex, pageSize int, keyword string) *data.FollowedFundPagedResult {
+	return data.NewFundApi().GetFollowedFundPaged(pageIndex, pageSize, keyword)
 }
 func (a *App) SaveAsMarkdown(stockCode, stockName string) string {
 	res := data.NewDeepSeekOpenAi(a.ctx, 0).GetAIResponseResult(stockCode)
@@ -1399,12 +2231,12 @@ func (a *App) SetStockAICron(cronText, stockCode string) {
 		stockCode = strings.Replace(stockCode, "gb_", "us", 1)
 		stockCode = strings.Replace(stockCode, "GB_", "us", 1)
 	}
-	if entryID, exists := a.cronEntrys[stockCode]; exists {
+	if entryID, exists := a.getCronEntry(stockCode); exists {
 		a.cron.Remove(entryID)
 	}
 	follow := data.NewStockDataApi().GetFollowedStockByStockCode(stockCode)
 	id, _ := a.cron.AddFunc(cronText, a.AddCronTask(follow))
-	a.cronEntrys[stockCode] = id
+	a.setCronEntry(stockCode, id)
 
 }
 func (a *App) AddGroup(group data.Group) string {
@@ -1421,6 +2253,15 @@ func (a *App) GetGroupList() []data.Group {
 
 func (a *App) UpdateGroupSort(id int, newSort int) bool {
 	return data.NewStockGroupApi(db.Dao).UpdateGroupSort(id, newSort)
+}
+
+// UpdateGroup 修改分组名称
+func (a *App) UpdateGroup(id int, name string) string {
+	ok := data.NewStockGroupApi(db.Dao).UpdateGroup(id, name)
+	if ok {
+		return "修改成功"
+	}
+	return "修改失败"
 }
 
 func (a *App) InitializeGroupSort() bool {
@@ -1459,6 +2300,13 @@ func (a *App) RemoveGroup(groupId int) string {
 }
 
 func (a *App) GetStockKLine(stockCode, stockName string, days int64) *[]data.KLineData {
+	// 港股优先使用 gotdx (通达信 ExKLine2) 获取日K线，失败再降级到腾讯接口
+	if data.IsHKStockCode(stockCode) {
+		tdxData := data.NewTdxKLineApi().GetMACKLineData(stockCode, "101", int(days))
+		if tdxData != nil && len(*tdxData) > 0 {
+			return tdxData
+		}
+	}
 	return data.NewStockDataApi().GetHK_KLineData(stockCode, "day", days)
 }
 
@@ -1474,6 +2322,154 @@ func (a *App) GetStockMinutePriceLineData(stockCode, stockName string) map[strin
 
 func (a *App) GetStockCommonKLine(stockCode, stockName string, days int64) *[]data.KLineData {
 	return data.NewStockDataApi().GetCommonKLineData(stockCode, "day", days)
+}
+
+// GetStockEastMoneyKLine 东方财富多周期 K 线（分钟：1/5/10/60/120；日 101、周 102、半年 105、年 106）。
+// klt 与东方财富接口一致；10 分钟由 1 分钟数据聚合。limit 为根数上限（最大 5000）。
+func (a *App) GetStockEastMoneyKLine(stockCode, stockName string, klt string, limit int) *[]data.KLineData {
+	return a.GetStockEastMoneyKLinePage(stockCode, stockName, klt, limit, "")
+}
+
+// GetStockEastMoneyKLinePage 分页拉取 K 线：end 为东财 end 参数（YYYYMMDD 或 YYYYMMDDHHmmss），空字符串表示取最新一段（同 GetStockEastMoneyKLine）。
+func (a *App) GetStockEastMoneyKLinePage(stockCode, stockName string, klt string, limit int, end string) *[]data.KLineData {
+	if limit <= 0 {
+		limit = 500
+	}
+	if limit > 5000 {
+		limit = 5000
+	}
+	klt = strings.TrimSpace(klt)
+	if klt == "" {
+		klt = "1"
+	}
+	api := data.NewEastMoneyKLineApi(data.GetSettingConfig())
+	end = strings.TrimSpace(end)
+	//if klt == "10" {
+	//	fetchN := limit * 10
+	//	if fetchN > 5000 {
+	//		fetchN = 5000
+	//	}
+	//	raw := api.GetKLineDataBefore(stockCode, "1", "", fetchN, end)
+	//	return data.AggregateKLineEveryN(raw, 10)
+	//}
+	return api.GetKLineDataBefore(stockCode, klt, "", limit, end)
+}
+
+// GetStockKLineWithFallback 多数据源自动切换 K 线：优先东方财富，不可用时自动切换新浪财经。
+// 返回 KLineSourceResult，包含 data（K 线数组）和 source（实际使用的数据源标识：eastmoney / sina）。
+// adjustFlag 控制复权类型："qfq"前复权、"hfq"后复权、"none"/"0"不复权、""沿用各数据源默认行为。
+func (a *App) GetStockKLineWithFallback(stockCode, stockName string, klt string, limit int, adjustFlag string) *data.KLineSourceResult {
+	if limit <= 0 {
+		limit = 500
+	}
+	if limit > 5000 {
+		limit = 5000
+	}
+	klt = strings.TrimSpace(klt)
+	if klt == "" {
+		klt = "101"
+	}
+	return data.FetchKLineWithFallback(stockCode, stockName, klt, limit, "", adjustFlag)
+}
+
+// GetStockKLinePageWithFallback 多数据源自动切换 K 线（分页）：优先东方财富，不可用时自动切换新浪财经。
+// end 参数仅对东方财富有效；新浪数据源不支持分页，将返回最新一段数据。
+// adjustFlag 控制复权类型："qfq"前复权、"hfq"后复权、"none"/"0"不复权、""沿用各数据源默认行为。
+func (a *App) GetStockKLinePageWithFallback(stockCode, stockName string, klt string, limit int, end string, adjustFlag string) *data.KLineSourceResult {
+	if limit <= 0 {
+		limit = 500
+	}
+	if limit > 5000 {
+		limit = 5000
+	}
+	klt = strings.TrimSpace(klt)
+	if klt == "" {
+		klt = "101"
+	}
+	end = strings.TrimSpace(end)
+	return data.FetchKLineWithFallback(stockCode, stockName, klt, limit, end, adjustFlag)
+}
+
+// GetChipDistribution 获取/计算股票筹码分布（筹码图）数据（用于前端绘图）。
+// days：近多少个交易日；bins：分箱数量；adjustFlag：""/qfq/hfq
+func (a *App) GetChipDistribution(stockCode string, days int, bins int, adjustFlag string) (*data.ChipDistributionResult, error) {
+	stockCode = strings.TrimSpace(stockCode)
+	if stockCode == "" {
+		return nil, fmt.Errorf("stockCode 不能为空")
+	}
+	if days <= 0 {
+		days = 120
+	}
+	if bins <= 0 {
+		bins = 80
+	}
+	adjustFlag = strings.TrimSpace(strings.ToLower(adjustFlag))
+	if adjustFlag != "" && adjustFlag != "qfq" && adjustFlag != "hfq" {
+		adjustFlag = "qfq"
+	}
+
+	api := data.NewEastMoneyKLineApi(data.GetSettingConfig())
+	if !api.ValidateStockCode(stockCode) {
+		return nil, fmt.Errorf("股票代码无效：%s", stockCode)
+	}
+
+	var kLines *[]data.KLineData
+
+	if adjustFlag != "" {
+		kLines = api.GetKLineData(stockCode, "101", adjustFlag, days)
+	} else {
+		result := data.FetchKLineWithFallback(stockCode, "", "101", days, "")
+		if result != nil && result.Data != nil {
+			kLines = result.Data
+		}
+	}
+
+	if kLines == nil || len(*kLines) == 0 {
+		return nil, fmt.Errorf("未获取到K线数据")
+	}
+	calculator := data.NewChipDistributionCalculator()
+	return calculator.Calculate(stockCode, *kLines, bins)
+}
+
+// GetTdxCallAuction 通过通达信协议获取集合竞价数据。
+// stockCode 格式如 600519.SH、000001.SZ、430047.BJ；start 为起始位置（0=最新）；count 为请求数量（最大 500）。
+func (a *App) GetTdxCallAuction(stockCode string, start uint32, count uint32) *[]data.TdxCallAuctionData {
+	if count <= 0 {
+		count = 500
+	}
+	api := data.NewTdxKLineApi()
+	return api.GetCallAuction(stockCode, start, count)
+}
+
+func (a *App) GetTdxCompanyInfo(stockCode string) *data.TdxCompanyInfoBundle {
+	api := data.NewTdxKLineApi()
+	return api.GetF10Data(stockCode)
+}
+
+func (a *App) GetTdxFinanceInfo(stockCode string) *data.TdxFinanceInfo {
+	api := data.NewTdxKLineApi()
+	return api.GetFinanceInfo(stockCode)
+}
+
+func (a *App) GetTdxXDXRInfo(stockCode string) *[]data.TdxXDXRItem {
+	api := data.NewTdxKLineApi()
+	return api.GetXDXRInfo(stockCode)
+}
+
+func (a *App) GetTdxCompanyCategoryList(stockCode string) *[]data.TdxCompanyCategory {
+	api := data.NewTdxKLineApi()
+	return api.GetF10CategoryList(stockCode)
+}
+
+func (a *App) GetTdxCompanyCategoryContent(stockCode string, categoryName string) *data.TdxCompanyInfoSection {
+	api := data.NewTdxKLineApi()
+	return api.GetF10CategoryContent(stockCode, categoryName)
+}
+
+// GetTdxSymbolBelongBoard 通过通达信 MAC 接口获取股票所属板块信息
+func (a *App) GetTdxSymbolBelongBoard(stockCode string) *[]data.MACBelongBoardItem {
+	api := data.NewTdxKLineApi()
+	return api.GetMACSymbolBelongBoard(stockCode)
 }
 
 func (a *App) GetTelegraphList(source string) *[]*models.Telegraph {
@@ -1494,18 +2490,59 @@ func (a *App) GlobalStockIndexes() map[string]any {
 	return data.NewMarketNewsApi().GlobalStockIndexes(30)
 }
 
-func (a *App) SummaryStockNews(question string, aiConfigId int, sysPromptId *int, enableTools bool, think bool) {
+// GlobalStockIndexesReadable 将全球指数 JSON 转为 AI 易读 Markdown 文本。
+func (a *App) GlobalStockIndexesReadable() string {
+	return data.NewMarketNewsApi().GlobalStockIndexesReadable(30)
+}
+
+func (a *App) SummaryStockNews(question string, aiConfigId int, sysPromptId *int, enableTools bool, think bool, eventName string, historyJSON string) {
+	ctx, cancel := context.WithCancel(a.ctx)
+
+	// 保存当前会话的 cancel，用于前端中断
+	a.summaryMu.Lock()
+	if a.summaryCancel != nil {
+		a.summaryCancel()
+	}
+	a.summaryCancel = cancel
+	a.summaryMu.Unlock()
+
+	// 允许前端自定义事件名，避免不同页面之间的事件冲突
+	if strings.TrimSpace(eventName) == "" {
+		eventName = "summaryStockNews"
+	}
+
+	// 解析对话历史（AI 助手记忆）：空字符串或解析失败则无历史
+	var history []map[string]interface{}
+	if strings.TrimSpace(historyJSON) != "" {
+		var list []models.AiAssistantMessage
+		if err := json.Unmarshal([]byte(historyJSON), &list); err == nil && len(list) > 0 {
+			history = make([]map[string]interface{}, 0, len(list))
+			for _, m := range list {
+				item := map[string]interface{}{"role": m.Role, "content": m.Content}
+				if m.Role == "assistant" && m.Reasoning != "" {
+					item["reasoning_content"] = m.Reasoning
+				}
+				history = append(history, item)
+			}
+		}
+	}
+
 	var msgs <-chan map[string]any
 	if enableTools {
-		msgs = data.NewDeepSeekOpenAi(a.ctx, aiConfigId).NewSummaryStockNewsStreamWithTools(question, sysPromptId, a.AiTools, think)
+		msgs = data.NewDeepSeekOpenAi(ctx, aiConfigId).NewSummaryStockNewsStreamWithTools(question, sysPromptId, a.AiTools, think, history)
 	} else {
-		msgs = data.NewDeepSeekOpenAi(a.ctx, aiConfigId).NewSummaryStockNewsStream(question, sysPromptId, think)
+		msgs = data.NewDeepSeekOpenAi(ctx, aiConfigId).NewSummaryStockNewsStream(question, sysPromptId, think, history)
 	}
 
 	for msg := range msgs {
-		runtime.EventsEmit(a.ctx, "summaryStockNews", msg)
+		runtime.EventsEmit(a.ctx, eventName, msg)
 	}
-	runtime.EventsEmit(a.ctx, "summaryStockNews", "DONE")
+
+	a.summaryMu.Lock()
+	a.summaryCancel = nil
+	a.summaryMu.Unlock()
+
+	runtime.EventsEmit(a.ctx, eventName, "DONE")
 }
 func (a *App) GetIndustryRank(sort string, cnt int) []any {
 	res := data.NewMarketNewsApi().GetIndustryRank(sort, cnt)
@@ -1543,7 +2580,6 @@ func (a *App) OpenURL(url string) {
 //	@param base64Data
 //	@return error
 func (a *App) SaveImage(name, base64Data string) string {
-	// 打开保存文件对话框
 	filePath, err := runtime.SaveFileDialog(a.ctx, runtime.SaveDialogOptions{
 		Title:           "保存图片",
 		DefaultFilename: name + "AI分析.png",
@@ -1558,10 +2594,24 @@ func (a *App) SaveImage(name, base64Data string) string {
 		return "文件路径,无法保存。"
 	}
 
-	// 解码并保存
+	base64Data = strings.ReplaceAll(base64Data, " ", "+")
+	base64Data = strings.ReplaceAll(base64Data, "\n", "")
+	base64Data = strings.ReplaceAll(base64Data, "\r", "")
+	if idx := strings.Index(base64Data, ";base64,"); idx != -1 {
+		base64Data = base64Data[idx+8:]
+	} else if idx := strings.Index(base64Data, "base64,"); idx != -1 {
+		base64Data = base64Data[idx+7:]
+	} else if strings.HasPrefix(base64Data, "data:") {
+		if commaIdx := strings.Index(base64Data, ","); commaIdx != -1 {
+			base64Data = base64Data[commaIdx+1:]
+		}
+	}
 	decodeString, err := base64.StdEncoding.DecodeString(base64Data)
 	if err != nil {
-		return "文件内容异常,无法保存。"
+		decodeString, err = base64.RawStdEncoding.DecodeString(base64Data)
+	}
+	if err != nil {
+		return "文件内容异常,无法保存。" + err.Error()
 	}
 
 	err = os.WriteFile(filepath.Clean(filePath), decodeString, os.ModePerm)
@@ -1579,7 +2629,6 @@ func (a *App) SaveImage(name, base64Data string) string {
 //	@param base64Data
 //	@return error
 func (a *App) SaveWordFile(filename string, base64Data string) string {
-	// 弹出保存文件对话框
 	filePath, err := runtime.SaveFileDialog(a.ctx, runtime.SaveDialogOptions{
 		Title:           "保存 Word 文件",
 		DefaultFilename: filename,
@@ -1591,12 +2640,25 @@ func (a *App) SaveWordFile(filename string, base64Data string) string {
 		return "文件路径,无法保存。"
 	}
 
-	// 解码 base64 内容
+	base64Data = strings.ReplaceAll(base64Data, " ", "+")
+	base64Data = strings.ReplaceAll(base64Data, "\n", "")
+	base64Data = strings.ReplaceAll(base64Data, "\r", "")
+	if idx := strings.Index(base64Data, ";base64,"); idx != -1 {
+		base64Data = base64Data[idx+8:]
+	} else if idx := strings.Index(base64Data, "base64,"); idx != -1 {
+		base64Data = base64Data[idx+7:]
+	} else if strings.HasPrefix(base64Data, "data:") {
+		if commaIdx := strings.Index(base64Data, ","); commaIdx != -1 {
+			base64Data = base64Data[commaIdx+1:]
+		}
+	}
 	decodeString, err := base64.StdEncoding.DecodeString(base64Data)
 	if err != nil {
-		return "文件内容异常,无法保存。"
+		decodeString, err = base64.RawStdEncoding.DecodeString(base64Data)
 	}
-	// 保存为文件
+	if err != nil {
+		return "文件内容异常,无法保存。" + err.Error()
+	}
 	err = os.WriteFile(filepath.Clean(filePath), decodeString, 0777)
 	if err != nil {
 		return "保存结果异常,无法保存。"
@@ -1606,9 +2668,730 @@ func (a *App) SaveWordFile(filename string, base64Data string) string {
 
 // GetAiConfigs
 //
-//	@Description: // 获取AiConfig列表
+//	@Description: // 获取 AiConfig 列表
 //	@receiver a
 //	@return error
 func (a *App) GetAiConfigs() []*data.AIConfig {
 	return data.GetSettingConfig().AiConfigs
+}
+
+// GetAiAssistantSession 获取 AI 助手会话消息列表，sessionId 为空时获取最新的
+func (a *App) GetAiAssistantSession(sessionId string) (*models.AiAssistantSessionResp, error) {
+	return data.GetAiAssistantSession(sessionId)
+}
+
+// SaveAiAssistantSession 保存 AI 助手会话消息到数据库
+func (a *App) SaveAiAssistantSession(sessionId string, messages []models.AiAssistantMessage) error {
+	return data.SaveAiAssistantSession(sessionId, messages)
+}
+
+// FetchAiModels
+//
+//	@Description: 根据接口地址与 apiKey 自动获取支持的模型列表（OpenAI/DeepSeek 兼容 /models 接口）
+//	@receiver a
+//	@param baseUrl 接口地址（如 https://api.deepseek.com）
+//	@param apiKey  鉴权令牌
+//	@return []string 模型 ID 列表
+func (a *App) FetchAiModels(baseUrl, apiKey string) []string {
+	baseUrl = strutil.Trim(baseUrl)
+	apiKey = strutil.Trim(apiKey)
+	if baseUrl == "" || apiKey == "" {
+		return []string{}
+	}
+
+	type modelItem struct {
+		ID string `json:"id"`
+	}
+	var respData struct {
+		Data []modelItem `json:"data"`
+	}
+
+	client := data.SharedHTTPClient
+	client.SetBaseURL(baseUrl)
+
+	resp, err := client.R().
+		SetHeader("Authorization", "Bearer "+apiKey).
+		SetHeader("Content-Type", "application/json").
+		SetResult(&respData).
+		Get("/models")
+	if err != nil {
+		logger.SugaredLogger.Errorf("FetchAiModels error: %v", err)
+		return []string{}
+	}
+	if resp.IsError() {
+		logger.SugaredLogger.Errorf("FetchAiModels http error: %s", resp.Status())
+		return []string{}
+	}
+
+	modelsList := make([]string, 0, len(respData.Data))
+	for _, m := range respData.Data {
+		if strings.TrimSpace(m.ID) != "" {
+			modelsList = append(modelsList, m.ID)
+		}
+	}
+	return modelsList
+}
+
+type AiModelInfo struct {
+	ModelName string `json:"modelName"`
+	MaxTokens int    `json:"maxTokens"`
+	Source    string `json:"source"`
+}
+
+func (a *App) FetchAiModelInfo(baseUrl, apiKey, modelName string) *AiModelInfo {
+	baseUrl = strutil.Trim(baseUrl)
+	modelName = strutil.Trim(modelName)
+	if baseUrl == "" || modelName == "" {
+		return nil
+	}
+
+	info := &AiModelInfo{
+		ModelName: modelName,
+		MaxTokens: 0,
+		Source:    "",
+	}
+
+	if apiKey != "" {
+		type modelDetail struct {
+			ID             string `json:"id"`
+			MaxContextLen  int    `json:"max_context_length"`
+			ContextLength  int    `json:"context_length"`
+			MaxOutputTok   int    `json:"max_output_tokens"`
+			MaxTokensField int    `json:"max_tokens"`
+		}
+		var detail modelDetail
+
+		client := data.SharedHTTPClient
+		client.SetBaseURL(baseUrl)
+
+		resp, err := client.R().
+			SetHeader("Authorization", "Bearer "+apiKey).
+			SetHeader("Content-Type", "application/json").
+			SetResult(&detail).
+			Get("/models/" + modelName)
+
+		if err == nil && !resp.IsError() && detail.ID != "" {
+			if detail.MaxContextLen > 0 {
+				info.MaxTokens = detail.MaxContextLen
+				info.Source = "api"
+			} else if detail.ContextLength > 0 {
+				info.MaxTokens = detail.ContextLength
+				info.Source = "api"
+			} else if detail.MaxOutputTok > 0 {
+				info.MaxTokens = detail.MaxOutputTok
+				info.Source = "api"
+			} else if detail.MaxTokensField > 0 {
+				info.MaxTokens = detail.MaxTokensField
+				info.Source = "api"
+			}
+		}
+	}
+
+	if info.MaxTokens == 0 {
+		if maxTokens := getBuiltinModelMaxTokens(modelName); maxTokens > 0 {
+			info.MaxTokens = maxTokens
+			info.Source = "builtin"
+		}
+	}
+
+	return info
+}
+
+func getBuiltinModelMaxTokens(modelName string) int {
+	modelTokenMap := map[string]int{
+		"deepseek-chat":        65536,
+		"deepseek-reasoner":    65536,
+		"deepseek-coder":       16384,
+		"deepseek-v3":          65536,
+		"deepseek-r1":          65536,
+		"gpt-4o":               16384,
+		"gpt-4o-mini":          16384,
+		"gpt-4o-2024-05-13":    4096,
+		"gpt-4-turbo":          4096,
+		"gpt-4-turbo-preview":  4096,
+		"gpt-4":                8192,
+		"gpt-4-32k":            32768,
+		"gpt-3.5-turbo":        4096,
+		"gpt-3.5-turbo-16k":    16384,
+		"gpt-4.1":              32768,
+		"gpt-4.1-mini":         32768,
+		"gpt-4.1-nano":         32768,
+		"o1":                   100000,
+		"o1-mini":              65536,
+		"o1-preview":           32768,
+		"o3-mini":              100000,
+		"o4-mini":              100000,
+		"claude-3-5-sonnet":    8192,
+		"claude-3-5-haiku":     8192,
+		"claude-3-opus":        4096,
+		"claude-3-sonnet":      4096,
+		"claude-3-haiku":       4096,
+		"glm-4":                8192,
+		"glm-4-plus":           4096,
+		"glm-4-air":            4096,
+		"glm-4-flash":          4096,
+		"glm-4-long":           4096,
+		"chatglm-turbo":        4096,
+		"moonshot-v1-8k":       8192,
+		"moonshot-v1-32k":      32768,
+		"moonshot-v1-128k":     131072,
+		"qwen-turbo":           8192,
+		"qwen-plus":            131072,
+		"qwen-max":             8192,
+		"qwen-long":            65536,
+		"qwen2.5-72b-instruct": 32768,
+		"hunyuan-lite":         4096,
+		"hunyuan-standard":     4096,
+		"hunyuan-pro":          4096,
+		"hunyuan-turbo":        4096,
+		"spark-lite":           4096,
+		"spark-pro":            4096,
+		"spark-max":            4096,
+		"spark-4.0-ultra":      4096,
+		"yi-light":             16384,
+		"yi-large":             16384,
+		"yi-medium":            16384,
+		"yi-spark":             16384,
+		"yi-vision":            16384,
+		"abab6.5-chat":         8192,
+		"abab6.5s-chat":        8192,
+		"abab5.5-chat":         4096,
+		"baichuan2-turbo":      4096,
+		"baichuan2-53b":        4096,
+		"ernie-4.0":            4096,
+		"ernie-3.5":            4096,
+		"ernie-speed":          4096,
+		"ernie-lite":           4096,
+	}
+
+	if maxTokens, ok := modelTokenMap[modelName]; ok {
+		return maxTokens
+	}
+
+	for prefix, maxTokens := range map[string]int{
+		"deepseek":      65536,
+		"gpt-4o":        16384,
+		"gpt-4-turbo":   4096,
+		"gpt-4-":        8192,
+		"gpt-3.5":       4096,
+		"gpt-4.1":       32768,
+		"o1-":           65536,
+		"o3-":           100000,
+		"o4-":           100000,
+		"claude-3":      8192,
+		"glm-4":         8192,
+		"chatglm":       4096,
+		"moonshot-v1":   8192,
+		"qwen-":         8192,
+		"qwen2":         32768,
+		"hunyuan-":      4096,
+		"spark-":        4096,
+		"yi-":           16384,
+		"abab":          8192,
+		"baichuan":      4096,
+		"ernie-":        4096,
+		"llama-3":       8192,
+		"llama3":        8192,
+		"mistral-":      8192,
+		"mixtral-":      32768,
+		"codestral-":    32768,
+		"gemini-1.5":    8192,
+		"gemini-2":      8192,
+		"command-r":     4096,
+		"Qwen/Qwen":     32768,
+		"deepseek-ai/":  65536,
+		"meta-llama/":   8192,
+		"mistralai/":    32768,
+		"Pro/deepseek-": 65536,
+		"Pro/qwen-":     32768,
+	} {
+		if strings.HasPrefix(modelName, prefix) {
+			return maxTokens
+		}
+	}
+
+	return 0
+}
+
+// InitCronTasks 在应用启动时，自动为启用状态的定时任务创建调度
+func (a *App) InitCronTasks() {
+	cronApi := agent.NewCronTaskApi()
+	if !cronApi.ExistsByTaskType("stock_change_save") {
+		task := &models.CronTask{
+			Name:        "异动数据保存",
+			CronExpr:    "0 */1 * * * *",
+			TaskType:    "stock_change_save",
+			Enable:      true,
+			Status:      "active",
+			Description: "每分钟自动保存A股异动数据（火箭发射、快速反弹、大笔买入、封涨停板等），交易时间外自动跳过",
+		}
+		err := cronApi.Create(task)
+		if err != nil {
+			logger.SugaredLogger.Errorf("自动创建异动数据保存任务失败：%v", err)
+		} else {
+			logger.SugaredLogger.Info("已自动创建异动数据保存定时任务")
+		}
+	}
+	tasks := cronApi.GetAll()
+	if len(tasks) == 0 {
+		return
+	}
+	for _, t := range tasks {
+		taskCopy := t
+		entryID, err := a.cron.AddFunc(taskCopy.CronExpr, func() {
+			err := agent.NewCronTaskApi().ExecuteTask(a.ctx, &taskCopy)
+			if err != nil {
+				logger.SugaredLogger.Errorf("启动任务失败：%v %s", err, taskCopy.Name)
+				return
+			}
+		})
+		if err != nil {
+			logger.SugaredLogger.Errorf("自动创建定时任务失败：%v %s", err, taskCopy.Name)
+			continue
+		}
+		a.setCronEntry(convertor.ToString(taskCopy.ID)+"_"+taskCopy.Name, entryID)
+	}
+}
+
+// AbortSummaryStockNews 取消当前进行中的 SummaryStockNews 流式回答
+func (a *App) AbortSummaryStockNews() {
+	a.summaryMu.Lock()
+	defer a.summaryMu.Unlock()
+	if a.summaryCancel != nil {
+		a.summaryCancel()
+		a.summaryCancel = nil
+	}
+}
+
+// CreateCronTask
+//
+//	@Description: 创建定时任务
+//	@receiver a
+//	@param task 定时任务信息
+//	@return string 操作结果
+func (a *App) CreateCronTask(task *models.CronTask) string {
+	err := agent.NewCronTaskApi().Create(task)
+	if err != nil {
+		return fmt.Sprintf("创建失败：%v", err)
+	}
+	taskCopy := *task
+	entryID, err := a.cron.AddFunc(taskCopy.CronExpr, func() {
+		err := agent.NewCronTaskApi().ExecuteTask(a.ctx, &taskCopy)
+		if err != nil {
+			logger.SugaredLogger.Errorf("执行任务失败：%v %s", err, taskCopy.Name)
+			return
+		}
+	})
+	a.setCronEntry(convertor.ToString(task.ID)+"_"+task.Name, entryID)
+	if err != nil {
+		return "任务创建成功,但定时失败"
+	}
+	return "创建成功"
+}
+
+func (a *App) UpdateCronTask(task *models.CronTask) string {
+	err := agent.NewCronTaskApi().Update(task)
+	if err != nil {
+		return fmt.Sprintf("更新失败：%v", err)
+	}
+	if entryID, exists := a.getCronEntry(convertor.ToString(task.ID) + "_" + task.Name); exists {
+		a.cron.Remove(entryID)
+	}
+	taskCopy := *task
+	entryID, err := a.cron.AddFunc(taskCopy.CronExpr, func() {
+		err := agent.NewCronTaskApi().ExecuteTask(a.ctx, &taskCopy)
+		if err != nil {
+			logger.SugaredLogger.Errorf("执行任务失败：%v %s", err, taskCopy.Name)
+			return
+		}
+	})
+	a.setCronEntry(convertor.ToString(task.ID)+"_"+task.Name, entryID)
+	if err != nil {
+		return fmt.Sprintf("更新失败：%v", err)
+	}
+	return "更新成功"
+}
+
+// DeleteCronTask
+//
+//	@Description: 删除定时任务
+//	@receiver a
+//	@param id 任务 ID
+//	@return string 操作结果
+func (a *App) DeleteCronTask(id uint) string {
+	err := agent.NewCronTaskApi().Delete(id)
+	task, err := agent.NewCronTaskApi().GetByID(id)
+	if err == nil {
+		if entryID, exists := a.getCronEntry(convertor.ToString(id) + "_" + task.Name); exists {
+			a.cron.Remove(entryID)
+		}
+	}
+	if err != nil {
+		return fmt.Sprintf("删除失败：%v", err)
+	}
+	return "删除成功"
+}
+
+// GetCronTaskByID
+//
+//	@Description: 根据 ID 获取定时任务
+//	@receiver a
+//	@param id 任务 ID
+//	@return *models.CronTask 任务信息
+func (a *App) GetCronTaskByID(id uint) *models.CronTask {
+	task, err := agent.NewCronTaskApi().GetByID(id)
+	if err != nil {
+		return nil
+	}
+	return task
+}
+
+// GetCronTaskList
+//
+//	@Description: 获取定时任务列表
+//	@receiver a
+//	@param query 查询条件
+//	@return *models.CronTaskPageResp 分页结果
+func (a *App) GetCronTaskList(query *models.CronTaskQuery) *models.CronTaskPageResp {
+	return agent.NewCronTaskApi().List(query)
+}
+
+// EnableCronTask
+//
+//	@Description: 启用/禁用定时任务
+//	@receiver a
+func (a *App) EnableCronTask(id uint, enable bool) string {
+	err := agent.NewCronTaskApi().EnableTask(id, enable)
+	task, err := agent.NewCronTaskApi().GetByID(id)
+	if err == nil {
+		if entryID, exists := a.getCronEntry(convertor.ToString(id) + "_" + task.Name); exists {
+			a.cron.Remove(entryID)
+		}
+		if enable {
+			taskCopy := *task
+			entryID, err := a.cron.AddFunc(taskCopy.CronExpr, func() {
+				err := agent.NewCronTaskApi().ExecuteTask(a.ctx, &taskCopy)
+				if err != nil {
+					logger.SugaredLogger.Errorf("%s 执行任务失败：%v", taskCopy.Name, err)
+					return
+				}
+			})
+			a.setCronEntry(convertor.ToString(id)+"_"+task.Name, entryID)
+			if err != nil {
+				return "操作成功,但定时失败"
+			}
+		}
+
+	}
+	if err != nil {
+		return fmt.Sprintf("操作失败：%v", err)
+	}
+	return "操作成功"
+}
+
+// ExecuteCronTaskNow
+//
+//	@Description: 立即执行定时任务
+//	@receiver a
+//	@param id 任务 ID
+//	@return string 操作结果
+func (a *App) ExecuteCronTaskNow(id uint) string {
+	task, err := agent.NewCronTaskApi().GetByID(id)
+	if err != nil {
+		return fmt.Sprintf("任务不存在：%v", err)
+	}
+
+	go func() {
+		err := agent.NewCronTaskApi().ExecuteTask(a.ctx, task)
+		if err != nil {
+			logger.SugaredLogger.Errorf("执行任务失败：%v %s", err, task.Name)
+		}
+	}()
+
+	return "任务执行中"
+}
+
+// GetCronTaskTypes
+//
+//	@Description: 获取所有任务类型
+//	@receiver a
+//	@return []lo.Tuple2[string, string] 任务类型列表
+func (a *App) GetCronTaskTypes() []lo.Tuple2[string, string] {
+	return agent.NewCronTaskApi().GetTaskTypes()
+}
+
+// ValidateCronExpr
+//
+//	@Description: 验证 Cron 表达式
+//	@receiver a
+//	@param expr Cron 表达式
+//	@return string 验证结果
+func (a *App) ValidateCronExpr(expr string) string {
+	err := agent.NewCronTaskApi().ValidateCronExpr(expr)
+	if err != nil {
+		return fmt.Sprintf("无效表达式：%v", err)
+	}
+	return "有效表达式"
+}
+
+// SearchCronTasks
+//
+//	@Description: 搜索定时任务
+//	@receiver a
+//	@param keyword 搜索关键词
+//	@return []models.CronTask 搜索结果
+func (a *App) SearchCronTasks(keyword string) []models.CronTask {
+	return agent.NewCronTaskApi().SearchTasks(keyword)
+}
+
+// CalculateNextRunTime 根据 Cron 表达式计算下一次运行时间
+// 参数:
+//   - cron: Cron 表达式，用于定义任务调度的时间规则
+//
+// 返回值:
+//   - string: 格式化为 "2006-01-02 15:04:05" 的下一次运行时间字符串
+func (a *App) CalculateNextRunTime(cron string) string {
+	nextRunTime := agent.NewCronTaskApi().CalculateNextRunTime(cron)
+	return nextRunTime.Format("2006-01-02 15:04:05")
+}
+
+// CalculateNextRunTimes 根据 Cron 表达式计算未来多次运行时间
+// 参数:
+//   - cron: Cron 表达式
+//   - count: 需要计算的次数
+//
+// 返回值:
+//   - []string: 按时间顺序排序的运行时间列表，格式为 "2006-01-02 15:04:05"
+func (a *App) CalculateNextRunTimes(cron string, count int) []string {
+	times := agent.NewCronTaskApi().CalculateNextRunTimes(cron, count)
+	result := make([]string, 0, len(times))
+	for _, t := range times {
+		result = append(result, t.Format("2006-01-02 15:04:05"))
+	}
+	return result
+}
+
+// AddTradingRecord 添加交易记录
+// 参数:
+//   - record: 交易记录结构体
+//
+// 返回值:
+//   - uint: 新添加的交易记录ID
+//   - error: 错误信息
+func (a *App) AddTradingRecord(record data.TradingRecord) (uint, error) {
+	return data.NewStockDataApi().AddTradingRecord(record)
+}
+
+// GetTradingRecordList 获取交易记录列表（分页与筛选，返回结构与 AI 推荐列表一致）
+func (a *App) GetTradingRecordList(query data.TradingRecordListQuery) *data.TradingRecordPageData {
+	page, err := data.NewStockDataApi().GetTradingRecordList(query)
+	if err != nil {
+		return &data.TradingRecordPageData{}
+	}
+	return page
+}
+
+// GetTradingRecordById 根据ID获取单个交易记录
+// 参数:
+//   - id: 交易记录ID
+//
+// 返回值:
+//   - *data.TradingRecord: 交易记录指针
+//   - error: 错误信息
+func (a *App) GetTradingRecordById(id uint) (*data.TradingRecord, error) {
+	return data.NewStockDataApi().GetTradingRecordById(id)
+}
+
+// GetTradingRecordStatistics 获取交易记录统计数据
+//
+// 返回值:
+//   - *data.TradingRecordStatistics: 统计数据指针
+func (a *App) GetTradingRecordStatistics() *data.TradingRecordStatistics {
+	stats, err := data.NewStockDataApi().GetTradingRecordStatistics()
+	if err != nil {
+		return &data.TradingRecordStatistics{}
+	}
+	return stats
+}
+
+// UpdateTradingRecord 更新交易记录
+// 参数:
+//   - record: 交易记录结构体
+//
+// 返回值:
+//   - error: 错误信息
+func (a *App) UpdateTradingRecord(record data.TradingRecord) error {
+	return data.NewStockDataApi().UpdateTradingRecord(record)
+}
+
+// DeleteTradingRecord 删除交易记录
+// 参数:
+//   - id: 交易记录ID
+//
+// 返回值:
+//   - error: 错误信息
+func (a *App) DeleteTradingRecord(id uint) error {
+	return data.NewStockDataApi().DeleteTradingRecord(id)
+}
+
+// CheckFrequentTrading 检查是否频繁交易
+// 参数:
+//   - stockCode: 股票代码
+//
+// 返回值:
+//   - map[string]any: 包含 canTrade (bool) 和 msg (string)
+func (a *App) CheckFrequentTrading(stockCode string) map[string]any {
+	canTrade, msg := data.NewStockDataApi().CheckFrequentTrading(stockCode)
+	return map[string]any{
+		"canTrade": canTrade,
+		"msg":      msg,
+	}
+}
+
+func (a *App) FetchAndSaveMarketStatistic() {
+	if !isTradingTime(time.Now()) {
+		logger.SugaredLogger.Debugf("当前非交易时间，跳过市场统计数据采集")
+		return
+	}
+	err := data.NewMarketStatisticApi().FetchAndSave()
+	if err != nil {
+		logger.SugaredLogger.Errorf("获取市场统计数据失败: %v", err)
+	}
+}
+
+func (a *App) GetTodayMarketStatistic() []models.MarketStatistic {
+	return data.NewMarketStatisticApi().GetTodayData()
+}
+
+func (a *App) GetMarketStatisticByDate(date string) []models.MarketStatistic {
+	return data.NewMarketStatisticApi().GetByDate(date)
+}
+
+func (a *App) GetRecentDaysMarketStatistic(days int) []models.MarketStatistic {
+	return data.NewMarketStatisticApi().GetRecentDaysData(days)
+}
+
+func (a *App) CreateMCPServer(server *models.MCPServer) string {
+	err := data.NewMCPServerApi().Create(server)
+	if err != nil {
+		logger.SugaredLogger.Errorf("创建MCP服务器失败: %v", err)
+		return "创建失败: " + err.Error()
+	}
+	return "创建成功"
+}
+
+func (a *App) UpdateMCPServer(server *models.MCPServer) string {
+	err := data.NewMCPServerApi().Update(server)
+	if err != nil {
+		logger.SugaredLogger.Errorf("更新MCP服务器失败: %v", err)
+		return "更新失败: " + err.Error()
+	}
+	return "更新成功"
+}
+
+func (a *App) DeleteMCPServer(id uint) string {
+	err := data.NewMCPServerApi().Delete(id)
+	if err != nil {
+		logger.SugaredLogger.Errorf("删除MCP服务器失败: %v", err)
+		return "删除失败: " + err.Error()
+	}
+	return "删除成功"
+}
+
+func (a *App) GetMCPServerByID(id uint) *models.MCPServer {
+	server, err := data.NewMCPServerApi().GetByID(id)
+	if err != nil {
+		logger.SugaredLogger.Errorf("获取MCP服务器失败: %v", err)
+		return nil
+	}
+	return server
+}
+
+func (a *App) GetMCPServerList(query *models.MCPServerQuery) *models.MCPServerPageResp {
+	return data.NewMCPServerApi().List(query)
+}
+
+func (a *App) EnableMCPServer(id uint, enable bool) string {
+	err := data.NewMCPServerApi().EnableServer(id, enable)
+	if err != nil {
+		logger.SugaredLogger.Errorf("启用/禁用MCP服务器失败: %v", err)
+		return "操作失败: " + err.Error()
+	}
+	if enable {
+		return "已启用"
+	}
+	return "已禁用"
+}
+
+func (a *App) TestMCPServer(id uint) string {
+	result, err := data.NewMCPServerApi().TestConnection(id)
+	if err != nil {
+		logger.SugaredLogger.Errorf("测试MCP服务器连接失败: %v", err)
+		return "测试失败: " + err.Error()
+	}
+	return result
+}
+
+func (a *App) CreateSkill(skill *models.Skill) string {
+	err := data.NewSkillApi().Create(skill)
+	if err != nil {
+		logger.SugaredLogger.Errorf("创建技能失败: %v", err)
+		return "创建失败: " + err.Error()
+	}
+	return "创建成功"
+}
+
+func (a *App) UpdateSkill(skill *models.Skill) string {
+	err := data.NewSkillApi().Update(skill)
+	if err != nil {
+		logger.SugaredLogger.Errorf("更新技能失败: %v", err)
+		return "更新失败: " + err.Error()
+	}
+	return "更新成功"
+}
+
+func (a *App) DeleteSkill(id uint) string {
+	err := data.NewSkillApi().Delete(id)
+	if err != nil {
+		logger.SugaredLogger.Errorf("删除技能失败: %v", err)
+		return "删除失败: " + err.Error()
+	}
+	return "删除成功"
+}
+
+func (a *App) GetSkillByID(id uint) *models.Skill {
+	skill, err := data.NewSkillApi().GetByID(id)
+	if err != nil {
+		logger.SugaredLogger.Errorf("获取技能失败: %v", err)
+		return nil
+	}
+	return skill
+}
+
+func (a *App) GetSkillList(query *models.SkillQuery) *models.SkillPageResp {
+	return data.NewSkillApi().List(query)
+}
+
+func (a *App) EnableSkill(id uint, enable bool) string {
+	err := data.NewSkillApi().EnableSkill(id, enable)
+	if err != nil {
+		logger.SugaredLogger.Errorf("启用/禁用技能失败: %v", err)
+		return "操作失败: " + err.Error()
+	}
+	if enable {
+		return "已启用"
+	}
+	return "已禁用"
+}
+
+func (a *App) GetAllSkills() []models.Skill {
+	return data.NewSkillApi().GetAll()
+}
+
+func (a *App) GetMCPToolsByServerID(serverID uint) []models.MCPServerTool {
+	return data.NewMCPServerApi().GetToolsByServerID(serverID)
+}
+
+func (a *App) GetAllMCPTools() []models.MCPServerTool {
+	return data.NewMCPServerApi().GetAllTools()
 }

@@ -22,6 +22,7 @@ type Settings struct {
 	OpenAiEnable           bool   `json:"openAiEnable"`
 	Prompt                 string `json:"prompt"`
 	CheckUpdate            bool   `json:"checkUpdate"`
+	UpdateChannel          string `json:"updateChannel"`
 	QuestionTemplate       string `json:"questionTemplate"`
 	CrawlTimeOut           int64  `json:"crawlTimeOut"`
 	KDays                  int64  `json:"kDays"`
@@ -38,6 +39,11 @@ type Settings struct {
 	HttpProxyEnabled       bool   `json:"httpProxyEnabled"`
 	EnableAgent            bool   `json:"enableAgent"`
 	QgqpBId                string `json:"qgqpBId" gorm:"column:qgqp_b_id"`
+	IwencaiApiKey          string `json:"iwencaiApiKey" gorm:"column:iwencai_api_key"`
+	EmApiKey               string `json:"emApiKey" gorm:"column:em_api_key"`
+	WindowWidth            int    `json:"windowWidth"`
+	WindowHeight           int    `json:"windowHeight"`
+	PromptPlazaApiBase     string `json:"promptPlazaApiBase" gorm:"column:prompt_plaza_api_base"`
 }
 
 func (receiver Settings) TableName() string {
@@ -45,16 +51,20 @@ func (receiver Settings) TableName() string {
 }
 
 type AIConfig struct {
-	ID          uint `gorm:"primarykey"`
-	CreatedAt   time.Time
-	UpdatedAt   time.Time
-	Name        string  `json:"name"`
-	BaseUrl     string  `json:"baseUrl"`
-	ApiKey      string  `json:"apiKey" `
-	ModelName   string  `json:"modelName"`
-	MaxTokens   int     `json:"maxTokens"`
-	Temperature float64 `json:"temperature"`
-	TimeOut     int     `json:"timeOut"`
+	ID               uint `gorm:"primarykey"`
+	CreatedAt        time.Time
+	UpdatedAt        time.Time
+	Name             string  `json:"name"`
+	BaseUrl          string  `json:"baseUrl"`
+	ApiKey           string  `json:"apiKey" `
+	ModelName        string  `json:"modelName"`
+	MaxTokens        int     `json:"maxTokens"`
+	Temperature      float64 `json:"temperature"`
+	TimeOut          int     `json:"timeOut"`
+	HttpProxy        string  `json:"httpProxy"`
+	HttpProxyEnabled bool    `json:"httpProxyEnabled"`
+	SessionId        string  `json:"sessionId" gorm:"index;size:64"`
+	Thinking         bool    `json:"thinking"`
 }
 
 func (AIConfig) TableName() string {
@@ -64,6 +74,18 @@ func (AIConfig) TableName() string {
 type SettingConfig struct {
 	*Settings
 	AiConfigs []*AIConfig `json:"aiConfigs"`
+}
+
+func (c *SettingConfig) GetAIConfigThinking(aiConfigId int) bool {
+	if aiConfigId <= 0 && len(c.AiConfigs) > 0 {
+		return c.AiConfigs[0].Thinking
+	}
+	for _, cfg := range c.AiConfigs {
+		if int(cfg.ID) == aiConfigId {
+			return cfg.Thinking
+		}
+	}
+	return false
 }
 
 type SettingsApi struct {
@@ -82,10 +104,13 @@ func (s *SettingsApi) Export() string {
 }
 
 func UpdateConfig(s *SettingConfig) string {
+	if s.Settings == nil {
+		return "保存失败: 配置数据为空"
+	}
 	count := int64(0)
 	db.Dao.Model(&Settings{}).Count(&count)
 	if count > 0 {
-		db.Dao.Model(&Settings{}).Where("id=?", s.ID).Updates(map[string]any{
+		result := db.Dao.Model(&Settings{}).Where("id=?", s.ID).Updates(map[string]any{
 			"local_push_enable":          s.LocalPushEnable,
 			"ding_push_enable":           s.DingPushEnable,
 			"ding_robot":                 s.DingRobot,
@@ -95,6 +120,7 @@ func UpdateConfig(s *SettingConfig) string {
 			"tushare_token":              s.TushareToken,
 			"prompt":                     s.Prompt,
 			"check_update":               s.CheckUpdate,
+			"update_channel":             s.UpdateChannel,
 			"question_template":          s.QuestionTemplate,
 			"crawl_time_out":             s.CrawlTimeOut,
 			"k_days":                     s.KDays,
@@ -110,23 +136,37 @@ func UpdateConfig(s *SettingConfig) string {
 			"http_proxy_enabled":         s.HttpProxyEnabled,
 			"enable_agent":               s.EnableAgent,
 			"qgqp_b_id":                  s.QgqpBId,
+			"iwencai_api_key":            s.IwencaiApiKey,
+			"em_api_key":                 s.EmApiKey,
+			"window_width":               s.WindowWidth,
+			"window_height":              s.WindowHeight,
+			"prompt_plaza_api_base":      s.PromptPlazaApiBase,
 		})
+		if result.Error != nil {
+			logger.SugaredLogger.Errorf("更新配置失败: %v", result.Error)
+			return "保存失败: " + result.Error.Error()
+		}
 
-		//更新AiConfig
 		err := updateAiConfigs(s.AiConfigs)
 		if err != nil {
 			logger.SugaredLogger.Errorf("更新AI模型服务配置失败: %v", err)
 			return "更新AI模型服务配置失败: " + err.Error()
 		}
 	} else {
-		logger.SugaredLogger.Infof("未找到配置，创建默认配置")
-		// 创建主配置
-		result := db.Dao.Model(&Settings{}).Create(&Settings{})
+		result := db.Dao.Model(&Settings{}).Create(s.Settings)
 		if result.Error != nil {
 			logger.SugaredLogger.Error("创建配置失败:", result.Error)
 			return "创建配置失败: " + result.Error.Error()
 		}
+		err := updateAiConfigs(s.AiConfigs)
+		if err != nil {
+			logger.SugaredLogger.Errorf("更新AI模型服务配置失败: %v", err)
+			return "更新AI模型服务配置失败: " + err.Error()
+		}
 	}
+
+	ConfigureFromSettings(s)
+
 	return "保存成功！"
 }
 
@@ -138,9 +178,13 @@ func updateAiConfigs(aiConfigs []*AIConfig) error {
 		}
 		return db.Dao.Exec("DELETE FROM sqlite_sequence WHERE name='ai_config'").Error
 	}
+	// 仅收集大于 0 的 ID，用于识别已存在的配置；
+	// ID<=0 视为“新配置”，强制走插入逻辑，避免多个 ID 为 0 的配置互相覆盖。
 	var ids []uint
 	lo.ForEach(aiConfigs, func(item *AIConfig, index int) {
-		ids = append(ids, item.ID)
+		if item.ID > 0 {
+			ids = append(ids, item.ID)
+		}
 	})
 	var existAiConfigs []*AIConfig
 	err := db.Dao.Model(&AIConfig{}).Select("id").Where("id in (?) ", ids).Find(&existAiConfigs).Error
@@ -158,18 +202,23 @@ func updateAiConfigs(aiConfigs []*AIConfig) error {
 		if e != nil {
 			return
 		}
-		if !idMap[item.ID] {
+		// ID<=0 一律视为新配置，走插入逻辑；否则根据是否已存在决定更新或新增
+		if item.ID <= 0 || !idMap[item.ID] {
 			addAiConfigs = append(addAiConfigs, item)
 		} else {
 			notDeleteIds = append(notDeleteIds, item.ID)
 			e = db.Dao.Model(&AIConfig{}).Where("id=?", item.ID).Updates(map[string]interface{}{
-				"name":        item.Name,
-				"base_url":    item.BaseUrl,
-				"api_key":     item.ApiKey,
-				"model_name":  item.ModelName,
-				"max_tokens":  item.MaxTokens,
-				"temperature": item.Temperature,
-				"time_out":    item.TimeOut,
+				"name":               item.Name,
+				"base_url":           item.BaseUrl,
+				"api_key":            item.ApiKey,
+				"model_name":         item.ModelName,
+				"max_tokens":         item.MaxTokens,
+				"temperature":        item.Temperature,
+				"time_out":           item.TimeOut,
+				"http_proxy":         item.HttpProxy,
+				"http_proxy_enabled": item.HttpProxyEnabled,
+				"session_id":         item.SessionId,
+				"thinking":           item.Thinking,
 			}).Error
 			if e != nil {
 				return
@@ -186,7 +235,7 @@ func updateAiConfigs(aiConfigs []*AIConfig) error {
 			return err
 		}
 	}
-	logger.SugaredLogger.Infof("更新aiConfigs +%d", len(addAiConfigs))
+	//logger.SugaredLogger.Infof("更新aiConfigs +%d", len(addAiConfigs))
 	//批量新增的配置
 	err = db.Dao.CreateInBatches(addAiConfigs, len(addAiConfigs)).Error
 	return err
@@ -198,12 +247,6 @@ func GetSettingConfig() *SettingConfig {
 	aiConfigs := make([]*AIConfig, 0)
 	// 处理数据库查询可能返回的空结果
 	result := db.Dao.Model(&Settings{}).First(settings)
-	if errors.Is(result.Error, gorm.ErrRecordNotFound) {
-		// 初始化默认设置并保存到数据库
-		settings = &Settings{OpenAiEnable: false, CrawlTimeOut: 60}
-		db.Dao.Create(settings)
-	}
-
 	if settings.OpenAiEnable {
 		// 处理AI配置查询可能出现的错误
 		result = db.Dao.Model(&AIConfig{}).Find(&aiConfigs)
@@ -220,7 +263,7 @@ func GetSettingConfig() *SettingConfig {
 			settings.CrawlTimeOut = 60
 		}
 		if settings.KDays < 30 {
-			settings.KDays = 120
+			settings.KDays = 60
 		}
 	}
 	if settings.BrowserPath == "" {
@@ -229,6 +272,8 @@ func GetSettingConfig() *SettingConfig {
 	if settings.BrowserPoolSize <= 0 {
 		settings.BrowserPoolSize = 1
 	}
+	settings.EnableAgent = false
+
 	settingConfig.Settings = settings
 	settingConfig.AiConfigs = aiConfigs
 
