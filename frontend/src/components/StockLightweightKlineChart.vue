@@ -72,8 +72,13 @@ const isEtfCode = computed(() => {
   const prefix = digits.substring(0, 2)
   return ['15', '16', '50', '51', '52', '53', '56', '58'].includes(prefix)
 })
-// 复权类型：qfq=前复权(默认)、hfq=后复权、none=不复权；仅日K及更长周期有效；场内 ETF 默认 none
-const activeAdjust = ref(isEtfCode.value ? 'none' : DEFAULT_ADJUST)
+// 港股识别：.HK 后缀或 HK 前缀；港股默认不复权（与项目约定一致），保留复权切换按钮
+const isHkCode = computed(() => {
+  const c = String(props.code || '').toUpperCase()
+  return c.endsWith('.HK') || c.startsWith('HK')
+})
+// 复权类型：qfq=前复权(默认)、hfq=后复权、none=不复权；仅日K及更长周期有效；场内 ETF/港股默认 none
+const activeAdjust = ref((isEtfCode.value || isHkCode.value) ? 'none' : DEFAULT_ADJUST)
 // 实际传给后端的复权标识：分时周期传空串（走各数据源默认行为），日K类周期传 activeAdjust
 const adjustFlagForRequest = computed(() => {
   return DAILY_LIKE_KLT.has(activeKlt.value) ? activeAdjust.value : ''
@@ -4016,9 +4021,9 @@ watch(activeAdjust, () => {
   loadData()
 })
 
-// 代码切换时（调用方未用 :key 重建组件的防御性处理）按 ETF 规则重置复权默认值
+// 代码切换时（调用方未用 :key 重建组件的防御性处理）按 ETF/港股规则重置复权默认值
 watch(() => props.code, () => {
-  const next = isEtfCode.value ? 'none' : DEFAULT_ADJUST
+  const next = (isEtfCode.value || isHkCode.value) ? 'none' : DEFAULT_ADJUST
   if (activeAdjust.value !== next) {
     activeAdjust.value = next
   }

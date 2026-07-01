@@ -429,10 +429,9 @@ func tdxAggregationParams(klt string) (srcKlt string, n int) {
 }
 
 // GetMACKLineData 通过 MAC 行情接口获取 K 线数据
-// A股使用 MAC 客户端，港美股使用 MAC Ex 客户端
-// 港股同时在 MAC 和 MAC Ex 上尝试
+// A股使用 MAC 主客户端（MACSymbolBars），港美股使用 MAC Ex 扩展行情客户端（ExKLine2）
 // adjustFlag 可选，控制复权类型："qfq"前复权(默认A股)、"hfq"后复权、"none"/"0"不复权(默认港股)；
-// 港美股 ExKLine2 协议不支持复权参数，adjustFlag 对其无效。
+// 港美股 ExKLine2 协议不支持复权参数，adjustFlag 对其无效；东方财富降级源支持复权。
 func (t *TdxKLineApi) GetMACKLineData(stockCode string, klt string, limit int, adjustFlag ...string) *[]KLineData {
 	if limit <= 0 {
 		limit = 500
@@ -442,16 +441,10 @@ func (t *TdxKLineApi) GetMACKLineData(stockCode string, klt string, limit int, a
 
 	// 判断是否港美股
 	if exMarket, exCode, ok := macExMarketFromStockCode(stockCode); ok {
-		// 港股：先尝试 MAC 主服务器（MarketHK=3），再尝试扩展行情 ExKLine2（主板=31/创业板=48）
-		if IsHKStockCode(stockCode) {
-			// 港股 MAC 主客户端默认不复权
-			hkAdjust := tdxAdjustFromFlag(flag, types.AdjustNone)
-			data := t.getMACMainKLineData(uint8(types.MarketHK), exCode, klt, limit, hkAdjust)
-			if data != nil && len(*data) > 0 {
-				return data
-			}
-		}
-		// MAC Ex 扩展行情（ExKLine2 协议不支持复权参数，此处忽略 adjustFlag）
+		// 港美股统一走 MAC Ex 扩展行情（ExKLine2，主板=31/创业板=48/美股=74）。
+		// 注意：MAC 主客户端（MACSymbolBars）不支持港美股 market=3/4，会忽略 market 参数，
+		// 把 5 位港股代码当 A 股 6 位代码处理（如 02202→002202.SZ 金风科技），返回错误的非空数据，
+		// 因此港美股不再尝试 MAC 主源，直接走 ExKLine2（ExKLine2 协议不支持复权参数，忽略 adjustFlag）。
 		return t.getMACExKLineData(exMarket, exCode, klt, limit)
 	}
 
@@ -518,53 +511,6 @@ func (t *TdxKLineApi) getMACMainKLineDataEx(stockCode string, klt string, limit 
 		converted = *AggregateKLineEveryN(&converted, aggN)
 	}
 
-	return &converted
-}
-
-// getMACMainKLineData 通过 MAC 主客户端获取K线（指定 market 和 code），adjust 指定复权类型（港股默认不复权 AdjustNone）
-func (t *TdxKLineApi) getMACMainKLineData(market uint8, code string, klt string, limit int, adjust uint16) *[]KLineData {
-	result := &[]KLineData{}
-	if err := t.ensureMACClient(); err != nil {
-		logger.SugaredLogger.Errorf("TdxKLine ensureMACClient error: %v", err)
-		return result
-	}
-
-	aggSrc, aggN := tdxAggregationParams(klt)
-	actualKlt := klt
-	if aggSrc != "" {
-		actualKlt = aggSrc
-	}
-
-	klineType := tdxKLineTypeFromKlt(actualKlt)
-	if klineType < 0 {
-		return result
-	}
-
-	fetchCount := uint32(limit)
-	if aggN > 1 {
-		fetchCount = uint32(limit * aggN)
-		if fetchCount > 8000 {
-			fetchCount = 8000
-		}
-	}
-
-	t.macMu.Lock()
-	bars, err := t.macClient.MACSymbolBars(market, code, uint16(klineType), 1, 0, fetchCount, adjust)
-	t.macMu.Unlock()
-
-	if err != nil {
-		logger.SugaredLogger.Debugf("TdxKLine MAC main MACSymbolBars for HK error: %v", err)
-		return result
-	}
-
-	if len(bars) == 0 {
-		return result
-	}
-
-	converted := convertMACSymbolBar(bars)
-	if aggN > 1 {
-		converted = *AggregateKLineEveryN(&converted, aggN)
-	}
 	return &converted
 }
 
