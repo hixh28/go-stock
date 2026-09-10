@@ -1,6 +1,6 @@
 <script setup>
 import * as echarts from "echarts";
-import {computed, h, onBeforeMount, onBeforeUnmount, onMounted,onUnmounted, ref} from 'vue'
+import {computed, h, nextTick, onBeforeMount, onBeforeUnmount, onMounted,onUnmounted, ref} from 'vue'
 import {
   GetAIResponseResult,
   GetConfig,
@@ -8,6 +8,10 @@ import {
   GetPromptTemplates,
   GetTelegraphList,
   GlobalStockIndexes,
+  IsTradingTime,
+  IsHKTradingTime,
+  IsUSTradingTime,
+  OpenURL,
   ReFleshTelegraphList,
   SaveAIResponseResult,
   SaveAsMarkdown,
@@ -17,7 +21,9 @@ import {
 } from "../../wailsjs/go/main/App";
 import {EventsOff, EventsOn} from "../../wailsjs/runtime";
 import NewsList from "./newsList.vue";
+import PolicyNewsList from "./PolicyNewsList.vue";
 import KLineChart from "./KLineChart.vue";
+import StockLightweightKlineChart from "./StockLightweightKlineChart.vue";
 import { CaretDown, CaretUp, PulseOutline,} from "@vicons/ionicons5";
 import {NAvatar, NButton, NFlex, NText, useMessage, useNotification} from "naive-ui";
 import {MdPreview} from "md-editor-v3";
@@ -27,14 +33,19 @@ import IndustryMoneyRank from "./industryMoneyRank.vue";
 import StockResearchReportList from "./StockResearchReportList.vue";
 import StockNoticeList from "./StockNoticeList.vue";
 import LongTigerRankList from "./LongTigerRankList.vue";
+import LhbHotMoneyDaily from "./LhbHotMoneyDaily.vue";
 import IndustryResearchReportList from "./IndustryResearchReportList.vue";
 import HotStockList from "./HotStockList.vue";
 import HotEvents from "./HotEvents.vue";
 import HotTopics from "./HotTopics.vue";
+import ConceptEventList from "./ConceptEventList.vue";
 import InvestCalendarTimeLine from "./InvestCalendarTimeLine.vue";
 import ClsCalendarTimeLine from "./ClsCalendarTimeLine.vue";
-import SelectStock from "./SelectStock.vue";
 import Stockhotmap from "./stockhotmap.vue";
+import BKFundFlowChart from "./bkFundFlowChart.vue";
+import ConceptFundFlowChart from "./conceptFundFlowChart.vue";
+import RzrqRank from "./RzrqRank.vue";
+import FuturesPositionChart from "./FuturesPositionChart.vue";
 
 const route = useRoute()
 const icon = ref('https://raw.githubusercontent.com/ArvinLovegood/go-stock/master/build/appicon.png');
@@ -59,6 +70,40 @@ const httpProxyEnabled = ref(false)
 const theme = computed(() => {
   return darkTheme ? 'dark' : 'light'
 })
+// Polymarket 预测市场列表
+const polymarketMarkets = ref([
+  {
+    marketSlug: 'will-the-fed-increase-interest-rates-by-25-bps-after-the-september-2026-meeting-649',
+    eventUrl: 'https://polymarket.com/event/fed-decision-in-september-762',
+    title: '美联储将在2026年9月会议后加息25个基点吗？',
+    yesPct: '60%',
+    noPct: '41%'
+  },
+  {
+    marketSlug: 'will-nvidia-be-the-largest-company-in-the-world-by-market-cap-on-december-31-244',
+    eventUrl: 'https://polymarket.com/event/largest-company-end-of-december-2026',
+    title: '问题：截至12月31日，NVIDIA 是否会成为全球市值最大的公司？',
+    yesPct: '56%',
+    noPct: '45%'
+  }
+])
+function polymarketSrc(m) {
+  return `https://embed.polymarket.com/market?market=${m.marketSlug}&theme=${darkTheme.value ? 'dark' : 'light'}&liveactivity=true&height=300`
+}
+function polymarketLdJson(m) {
+  return JSON.stringify({
+    '@context': 'https://schema.org',
+    '@type': 'WebPage',
+    'name': m.title,
+    'description': `Prediction market: 是 ${m.yesPct} · 否 ${m.noPct} on Polymarket.`,
+    'url': m.eventUrl,
+    'publisher': {
+      '@type': 'Organization',
+      'name': 'Polymarket',
+      'url': 'https://polymarket.com'
+    }
+  })
+}
 const aiSummary = ref(``)
 const aiSummaryTime = ref("")
 const modelName = ref("")
@@ -67,6 +112,7 @@ const question = ref(``)
 const aiConfigId = ref(null)
 const sysPromptId = ref(null)
 const loading = ref(true)
+const analysisStatus = ref('')
 const aiConfigs = ref([])
 const sysPromptOptions = ref([])
 const userPromptOptions = ref([])
@@ -76,6 +122,9 @@ const sort = ref("0")
 const nowTab = ref("市场快讯")
 const indexInterval = ref(null)
 const indexIndustryRank = ref(null)
+const tradingCheckInterval = ref(null)
+const mdPreviewRef = ref(null)
+const aiResultScrollRef = ref(null)
 const stockCode= ref('')
 const enableTools= ref(true)
 const thinkingMode = ref(true)
@@ -122,20 +171,21 @@ onBeforeMount(() => {
   })
   getIndex();
   industryRank();
-  indexInterval.value = setInterval(() => {
-    getIndex()
-  }, 3000)
+  startTradingTimers();
 
-  indexIndustryRank.value = setInterval(() => {
-    industryRank()
-    ReFlesh("财联社电报")
-    ReFlesh("新浪财经")
-    ReFlesh("外媒")
-  }, 1000 * 10)
-
-
-})
-onMounted(() => {
+  tradingCheckInterval.value = setInterval(async () => {
+    const [cn, hk, us] = await Promise.all([
+      IsTradingTime().catch(() => false),
+      IsHKTradingTime().catch(() => false),
+      IsUSTradingTime().catch(() => false)
+    ])
+    const anyTrading = cn || hk || us
+    if (anyTrading && !indexInterval.value) {
+      startTradingTimers()
+    } else if (!anyTrading && indexInterval.value) {
+      stopTradingTimers()
+    }
+  }, 60000)
 })
 
 
@@ -144,9 +194,35 @@ onBeforeUnmount(() => {
   EventsOff("newTelegraph")
   EventsOff("newSinaNews")
   EventsOff("summaryStockNews")
-  clearInterval(indexInterval.value)
-  clearInterval(indexIndustryRank.value)
+  stopTradingTimers()
+  if (tradingCheckInterval.value) {
+    clearInterval(tradingCheckInterval.value)
+  }
 })
+
+function startTradingTimers() {
+  stopTradingTimers()
+  indexInterval.value = setInterval(() => {
+    getIndex()
+  }, 3000)
+  indexIndustryRank.value = setInterval(() => {
+    industryRank()
+    ReFlesh("财联社电报")
+    ReFlesh("新浪财经")
+    ReFlesh("外媒")
+  }, 1000 * 10)
+}
+
+function stopTradingTimers() {
+  if (indexInterval.value) {
+    clearInterval(indexInterval.value)
+    indexInterval.value = null
+  }
+  if (indexIndustryRank.value) {
+    clearInterval(indexIndustryRank.value)
+    indexIndustryRank.value = null
+  }
+}
 
 onUnmounted(() => {
 
@@ -227,7 +303,8 @@ function reAiSummary() {
   aiSummary.value = ""
   summaryModal.value = true
   loading.value = true
-  SummaryStockNews(question.value,aiConfigId.value, sysPromptId.value,enableTools.value,thinkingMode.value)
+  analysisStatus.value = "正在连接AI服务..."
+  SummaryStockNews(question.value,aiConfigId.value, sysPromptId.value,enableTools.value,thinkingMode.value,"summaryStockNews","","","")
 }
 
 function getAiSummary() {
@@ -264,13 +341,19 @@ function updateTab(name) {
 }
 
 EventsOn("summaryStockNews", async (msg) => {
-  loading.value = false
-  ////console.log(msg)
   if (msg === "DONE") {
     await SaveAIResponseResult("市场资讯", "市场资讯", aiSummary.value, chatId.value, question.value,aiConfigId.value)
-    message.info("AI分析完成！")
+    loading.value = false
+    analysisStatus.value = "分析完成"
     message.destroyAll()
-
+    notify.success({
+      title: 'AI分析完成',
+      content: '市场资讯分析已完成',
+      duration: 3000,
+    })
+    setTimeout(() => {
+      analysisStatus.value = ""
+    }, 3000)
   } else {
     if (msg.chatId) {
       chatId.value = msg.chatId
@@ -278,8 +361,17 @@ EventsOn("summaryStockNews", async (msg) => {
     if (msg.question) {
       question.value = msg.question
     }
+    if (msg.content || msg.reasoning_content || msg.extraContent) {
+      if (!aiSummary.value) {
+        analysisStatus.value = "AI正在分析中..."
+      }
+      loading.value = false
+    }
     if (msg.content) {
       aiSummary.value = aiSummary.value + msg.content
+    }
+    if (msg.reasoning_content) {
+      aiSummary.value = aiSummary.value + msg.reasoning_content
     }
     if (msg.extraContent) {
       aiSummary.value = aiSummary.value + msg.extraContent
@@ -290,8 +382,20 @@ EventsOn("summaryStockNews", async (msg) => {
     if (msg.time) {
       aiSummaryTime.value = msg.time
     }
+    scrollToAiResultBottom()
   }
 })
+
+function scrollToAiResultBottom() {
+  nextTick(() => {
+    requestAnimationFrame(() => {
+      const el = aiResultScrollRef.value
+      if (el) {
+        el.scrollTop = el.scrollHeight
+      }
+    })
+  })
+}
 
 async function copyToClipboard() {
   try {
@@ -354,7 +458,7 @@ function ReFlesh(source) {
       <n-tab-pane name="市场快讯" tab="市场快讯">
         <n-grid :cols="1" :y-gap="0">
           <n-gi>
-            <AnalyzeMartket :dark-theme="darkTheme" :chart-height="300" :kDays="1" :name="'最近24小时热词'" />
+            <AnalyzeMartket :dark-theme="darkTheme" :chart-height="300" />
           </n-gi>
           <n-gi>
             <n-grid :cols="foreignNewsList.length?3:2" :y-gap="0">
@@ -372,6 +476,9 @@ function ReFlesh(source) {
           </n-gi>
         </n-grid>
 
+      </n-tab-pane>
+      <n-tab-pane name="政策新闻" tab="政策新闻">
+        <PolicyNewsList/>
       </n-tab-pane>
       <n-tab-pane name="全球股指" tab="全球股指">
         <n-tabs type="segment" animated>
@@ -411,94 +518,116 @@ function ReFlesh(source) {
             </n-grid>
           </n-tab-pane>
           <n-tab-pane name="上证指数" tab="上证指数">
-            <k-line-chart code="sh000001" :chart-height="panelHeight" name="上证指数" :k-days="20"
+            <k-line-chart code="sh000001" :chart-height="panelHeight" stockName="上证指数" :k-days="20"
                           :dark-theme="true"></k-line-chart>
           </n-tab-pane>
           <n-tab-pane name="深证成指" tab="深证成指">
-            <k-line-chart code="sz399001" :chart-height="panelHeight" name="深证成指" :k-days="20"
+            <k-line-chart code="sz399001" :chart-height="panelHeight" stockName="深证成指" :k-days="20"
                           :dark-theme="true"></k-line-chart>
           </n-tab-pane>
           <n-tab-pane name="创业板指" tab="创业板指">
-            <k-line-chart code="sz399006" :chart-height="panelHeight" name="创业板指" :k-days="20"
+            <k-line-chart code="sz399006" :chart-height="panelHeight" stockName="创业板指" :k-days="20"
                           :dark-theme="true"></k-line-chart>
           </n-tab-pane>
           <n-tab-pane name="恒生指数" tab="恒生指数">
-            <k-line-chart code="hkHSI" :chart-height="panelHeight" name="恒生指数" :k-days="20"
+            <k-line-chart code="hkHSI" :chart-height="panelHeight" stockName="恒生指数" :k-days="20"
                           :dark-theme="true"></k-line-chart>
           </n-tab-pane>
           <n-tab-pane name="纳斯达克" tab="纳斯达克">
-            <k-line-chart code="us.IXIC" :chart-height="panelHeight" name="纳斯达克" :k-days="20"
+            <k-line-chart code="us.IXIC" :chart-height="panelHeight" stockName="纳斯达克" :k-days="20"
                           :dark-theme="true"></k-line-chart>
           </n-tab-pane>
           <n-tab-pane name="道琼斯" tab="道琼斯">
-            <k-line-chart code="us.DJI" :chart-height="panelHeight" name="道琼斯" :k-days="20"
+            <k-line-chart code="us.DJI" :chart-height="panelHeight" stockName="道琼斯" :k-days="20"
                           :dark-theme="true"></k-line-chart>
           </n-tab-pane>
           <n-tab-pane name="标普500" tab="标普500">
-            <k-line-chart code="us.INX" :chart-height="panelHeight" name="标普500" :k-days="20"
+            <k-line-chart code="us.INX" :chart-height="panelHeight" stockName="标普500" :k-days="20"
                           :dark-theme="true"></k-line-chart>
           </n-tab-pane>
         </n-tabs>
       </n-tab-pane>
       <n-tab-pane name="重大指数" tab="重大指数">
         <n-tabs type="segment" animated>
-          <n-tab-pane name="恒生科技指数" tab="恒生科技指数">
-            <k-line-chart code="hkHSTECH" :chart-height="panelHeight" name="恒生科技指数" :k-days="20"
-                          :dark-theme="true"></k-line-chart>
+
+<!--          <n-tab-pane name="西部数据" tab="西部数据">-->
+<!--            <StockLightweightKlineChart code="105.WDC" :chart-height="panelHeight" stock-name="西部数据"-->
+<!--                                        :dark-theme="true"></StockLightweightKlineChart>-->
+<!--          </n-tab-pane>-->
+
+          <n-tab-pane name="上证指数" tab="上证指数"  >
+            <StockLightweightKlineChart code="000001.SH" :chart-height="panelHeight-130" stock-name="上证指数" :dark-theme="true"></StockLightweightKlineChart>
           </n-tab-pane>
-          <n-tab-pane name="科创50" tab="科创50"  >
-            <k-line-chart code="sh000688" :chart-height="panelHeight" name="科创50" :k-days="20"  
-                          :dark-theme="true"></k-line-chart>
+          <n-tab-pane name="深证指数" tab="深证指数"  >
+            <StockLightweightKlineChart code="399001.SZ" :chart-height="panelHeight-130" stock-name="深证指数" :dark-theme="true"></StockLightweightKlineChart>
           </n-tab-pane>
-          <n-tab-pane name="科创芯片" tab="科创芯片"  >
-            <k-line-chart code="sh000685" :chart-height="panelHeight" name="科创芯片" :k-days="20"
-                          :dark-theme="true"></k-line-chart>
+          <n-tab-pane name="创业板指" tab="创业板指"  >
+            <StockLightweightKlineChart code="399006.SZ" :chart-height="panelHeight-130" stock-name="创业板指" :dark-theme="true"></StockLightweightKlineChart>
           </n-tab-pane>
-          <n-tab-pane name="证券龙头" tab="证券龙头"  >
-            <k-line-chart code="sz399437" :chart-height="panelHeight" name="证券龙头" :k-days="20"
-                          :dark-theme="true"></k-line-chart>
+
+          <n-tab-pane name="恒生指数" tab="恒生指数">
+            <StockLightweightKlineChart code="100.HSI" :chart-height="panelHeight" stock-name="恒生指数"
+                                        :dark-theme="true"></StockLightweightKlineChart>
           </n-tab-pane>
-          <n-tab-pane name="高端装备" tab="高端装备"  >
-            <k-line-chart code="sz399437" :chart-height="panelHeight" name="高端装备" :k-days="20"
-                          :dark-theme="true"></k-line-chart>
+          <n-tab-pane name="道琼斯" tab="道琼斯">
+            <StockLightweightKlineChart code="100.DJIA" :chart-height="panelHeight" stock-name="道琼斯"
+                                        :dark-theme="true"></StockLightweightKlineChart>
           </n-tab-pane>
-          <n-tab-pane name="中证银行" tab="中证银行">
-            <k-line-chart code="sz399986" :chart-height="panelHeight" name="中证银行" :k-days="20"
-                          :dark-theme="true"></k-line-chart>
+          <n-tab-pane name="标普500" tab="标普500">
+            <StockLightweightKlineChart code="100.SPX" :chart-height="panelHeight" stock-name="标普500"
+                                        :dark-theme="true"></StockLightweightKlineChart>
           </n-tab-pane>
-          <n-tab-pane name="上证医药" tab="上证医药">
-            <k-line-chart code="sh000037" :chart-height="panelHeight" name="上证医药" :k-days="20"
-                          :dark-theme="true"></k-line-chart>
+          <n-tab-pane name="纳斯达克" tab="纳斯达克">
+            <StockLightweightKlineChart code="100.NDX" :chart-height="panelHeight" stock-name="纳斯达克"
+                                        :dark-theme="true"></StockLightweightKlineChart>
           </n-tab-pane>
+
           <n-tab-pane name="沪深300" tab="沪深300">
-            <k-line-chart code="sh000300" :chart-height="panelHeight" name="沪深300" :k-days="20"
-                          :dark-theme="true"></k-line-chart>
+            <StockLightweightKlineChart code="000300.SH" :chart-height="panelHeight-130" stock-name="沪深 300" :dark-theme="true"></StockLightweightKlineChart>
           </n-tab-pane>
           <n-tab-pane name="上证50" tab="上证50">
-            <k-line-chart code="sh000016" :chart-height="panelHeight" name="上证50" :k-days="20"
-                          :dark-theme="true"></k-line-chart>
+            <StockLightweightKlineChart code="000016.SH" :chart-height="panelHeight-130" stock-name="上证 50" :dark-theme="true"></StockLightweightKlineChart>
           </n-tab-pane>
           <n-tab-pane name="中证A500" tab="中证A500">
-            <k-line-chart code="sh000510" :chart-height="panelHeight" name="中证A500" :k-days="20"
-                          :dark-theme="true"></k-line-chart>
+            <StockLightweightKlineChart code="000510.SH" :chart-height="panelHeight-130" stock-name="中证 A500" :dark-theme="true"></StockLightweightKlineChart>
           </n-tab-pane>
           <n-tab-pane name="中证1000" tab="中证1000">
-            <k-line-chart code="sh000852" :chart-height="panelHeight" name="中证1000" :k-days="20"
-                          :dark-theme="true"></k-line-chart>
+            <StockLightweightKlineChart code="000852.SH" :chart-height="panelHeight-130" stock-name="中证 1000" :dark-theme="true"></StockLightweightKlineChart>
+          </n-tab-pane>
+
+          <n-tab-pane name="科创50" tab="科创50"  >
+            <StockLightweightKlineChart code="000688.SH" :chart-height="panelHeight-130" stock-name="科创 50" :dark-theme="true"></StockLightweightKlineChart>
+          </n-tab-pane>
+          <n-tab-pane name="科创芯片" tab="科创芯片"  >
+            <StockLightweightKlineChart code="000685.SH" :chart-height="panelHeight-130" stock-name="科创芯片" :dark-theme="true"></StockLightweightKlineChart>
+          </n-tab-pane>
+          <n-tab-pane name="证券龙头" tab="证券龙头"  >
+            <StockLightweightKlineChart code="399437.SZ" :chart-height="panelHeight-130" stock-name="证券龙头" :dark-theme="true"></StockLightweightKlineChart>
+          </n-tab-pane>
+          <n-tab-pane name="高端装备" tab="高端装备"  >
+            <StockLightweightKlineChart code="399437.SZ" :chart-height="panelHeight-130" stock-name="高端装备" :dark-theme="true"></StockLightweightKlineChart>
+          </n-tab-pane>
+          <n-tab-pane name="中证银行" tab="中证银行">
+            <StockLightweightKlineChart code="399986.SZ" :chart-height="panelHeight-130" stock-name="中证银行" :dark-theme="true"></StockLightweightKlineChart>
+          </n-tab-pane>
+          <n-tab-pane name="上证医药" tab="上证医药">
+            <StockLightweightKlineChart code="000037.SH" :chart-height="panelHeight-130" stock-name="上证医药" :dark-theme="true"></StockLightweightKlineChart>
           </n-tab-pane>
           <n-tab-pane name="中证白酒" tab="中证白酒">
-            <k-line-chart code="sz399997" :chart-height="panelHeight" name="中证白酒" :k-days="20"
-                          :dark-theme="true"></k-line-chart>
+            <StockLightweightKlineChart code="399997.SZ" :chart-height="panelHeight-130" stock-name="中证白酒" :dark-theme="true"></StockLightweightKlineChart>
           </n-tab-pane>
           <n-tab-pane name="富时中国三倍做多" tab="富时中国三倍做多">
-            <k-line-chart code="usYINN.AM" :chart-height="panelHeight" name="富时中国三倍做多" :k-days="20"
+            <k-line-chart code="usYINN.AM" :chart-height="panelHeight" stockName="富时中国三倍做多" :k-days="20"
                           :dark-theme="true"></k-line-chart>
           </n-tab-pane>
           <n-tab-pane name="VIX恐慌指数" tab="VIX恐慌指数">
-            <k-line-chart code="usUVXY.AM" :chart-height="panelHeight" name="VIX恐慌指数" :k-days="20"
+            <k-line-chart code="usUVXY.AM" :chart-height="panelHeight" stockName="VIX恐慌指数" :k-days="20"
                           :dark-theme="true"></k-line-chart>
           </n-tab-pane>
         </n-tabs>
+      </n-tab-pane>
+      <n-tab-pane name="期指多空" tab="期指多空">
+        <FuturesPositionChart variety="IF" :days="120" :chart-height="panelHeight-60" :dark-theme="true"/>
       </n-tab-pane>
       <n-tab-pane name="行业排名" tab="行业排名">
         <n-tabs type="card" animated>
@@ -632,8 +761,17 @@ function ReFlesh(source) {
           </n-tab-pane>
         </n-tabs>
       </n-tab-pane>
+      <n-tab-pane name="板块资金流向" tab="板块资金流向">
+        <BKFundFlowChart :dark-theme="darkTheme" :chart-height="600"/>
+      </n-tab-pane>
+      <n-tab-pane name="概念资金流向" tab="概念资金流向">
+        <ConceptFundFlowChart :dark-theme="darkTheme" :chart-height="600"/>
+      </n-tab-pane>
       <n-tab-pane name="龙虎榜" tab="龙虎榜">
         <LongTigerRankList />
+      </n-tab-pane>
+      <n-tab-pane name="游资动向" tab="游资动向">
+        <LhbHotMoneyDaily />
       </n-tab-pane>
       <n-tab-pane name="个股研报" tab="个股研报">
         <StockResearchReportList :stock-code="stockCode"/>
@@ -674,20 +812,72 @@ function ReFlesh(source) {
           <n-tab-pane name="财经日历" tab="财经日历">
             <ClsCalendarTimeLine />
           </n-tab-pane>
+          <n-tab-pane name="每日炒作题材" tab="每日炒作题材">
+            <ConceptEventList />
+          </n-tab-pane>
+          <n-tab-pane name="PolyMarket预测" tab="PolyMarket预测">
+            <n-grid :cols="2" :x-gap="12" :y-gap="12" responsive="screen" style="--wails-draggable:no-drag">
+              <n-grid-item v-for="m in polymarketMarkets" :key="m.marketSlug">
+                <n-card :title="m.title" size="small" style="height:100%">
+                  <component :is="'script'" type="application/ld+json" v-html="polymarketLdJson(m)"></component>
+                  <div style="display:flex;justify-content:center">
+                    <figure
+                      class="polymarket-embed"
+                      :aria-label="`Polymarket prediction market: ${m.title}`"
+                      style="position:relative;display:inline-block;margin:0"
+                    >
+                      <iframe
+                        :title="`${m.title} — Polymarket Prediction Market`"
+                        :src="polymarketSrc(m)"
+                        width="400"
+                        height="300"
+                        frameborder="0"
+                        allowtransparency="true"
+                      ></iframe>
+                      <a
+                        :href="m.eventUrl"
+                        aria-label="View on Polymarket"
+                        target="_blank"
+                        rel="noopener"
+                        style="position:absolute;top:16px;right:20px;width:120px;height:24px;z-index:10"
+                      ></a>
+                      <figcaption style="position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0">
+                        <strong>{{ m.title }}</strong><br>
+                        是 {{ m.yesPct }} · 否 {{ m.noPct }}<br>
+                        <a :href="m.eventUrl">
+                          View full market &amp; trade on Polymarket
+                        </a>
+                      </figcaption>
+                    </figure>
+                  </div>
+                </n-card>
+              </n-grid-item>
+            </n-grid>
+            <n-card title="Polymarket 财经市场" size="small" style="margin-top:12px;--wails-draggable:no-drag">
+              <n-flex justify="center" align="center" :wrap="false" style="gap:12px">
+                <n-text depth="2">polymarket.com 拒绝 iframe 嵌入，点击下方按钮在外部浏览器打开</n-text>
+                <n-button type="info" size="small" @click="OpenURL('https://polymarket.com/zh/finance')">
+                  打开 Polymarket 财经市场
+                </n-button>
+              </n-flex>
+            </n-card>
+          </n-tab-pane>
         </n-tabs>
-      </n-tab-pane>
-      <n-tab-pane name="指标选股" tab="指标选股">
-        <select-stock />
       </n-tab-pane>
       <n-tab-pane name="名站优选" tab="名站优选">
         <Stockhotmap />
       </n-tab-pane>
+      <n-tab-pane name="融资融券" tab="融资融券">
+        <RzrqRank :dark-theme="darkTheme"/>
+      </n-tab-pane>
     </n-tabs>
   </n-card>
-  <n-modal transform-origin="center" v-model:show="summaryModal" preset="card" style="width: 800px;"
+  <n-modal transform-origin="center" v-model:show="summaryModal" preset="card" style="width: 800px;max-width: calc(100vw - 32px);"
            :title="'AI市场资讯总结'">
-    <n-spin size="small" :show="loading">
-      <MdPreview style="height: 440px;text-align: left" :modelValue="aiSummary" :theme="theme"/>
+    <n-spin size="small" :show="loading && !aiSummary">
+      <div ref="aiResultScrollRef" style="height: 440px;max-height: 60vh;text-align: left;overflow-y: auto;">
+        <MdPreview ref="mdPreviewRef" :modelValue="aiSummary" :theme="theme"/>
+      </div>
     </n-spin>
     <template #footer>
       <n-flex justify="space-between" ref="tipsRef">
@@ -695,6 +885,7 @@ function ReFlesh(source) {
           <n-tag v-if="modelName" type="warning" round :title="chatId" :bordered="false">{{ modelName }}</n-tag>
           {{ aiSummaryTime }}
         </n-text>
+        <n-text type="success" v-if="analysisStatus">{{ analysisStatus }}</n-text>
         <n-text type="error">*AI分析结果仅供参考，请以实际行情为准。投资需谨慎，风险自担。</n-text>
       </n-flex>
     </template>
@@ -702,18 +893,18 @@ function ReFlesh(source) {
       <n-flex justify="left" style="margin-bottom: 10px">
         <n-switch v-model:value="enableTools" :round="false">
           <template #checked>
-            启用AI函数工具调用
+            工具调用
           </template>
           <template #unchecked>
-            不启用AI函数工具调用
+            非工具调用
           </template>
         </n-switch>
         <n-switch v-model:value="thinkingMode" :round="false">
           <template #checked>
-            启用思考模式
+            思考模式
           </template>
           <template #unchecked>
-            不启用思考模式
+            非思考模式
           </template>
         </n-switch>
 

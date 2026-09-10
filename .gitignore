@@ -103,11 +103,21 @@ dist
 # TernJS port file
 .tern-port
 
+ai-doc
 .DS_Store
-
+.trae
+.qoder
 .idea/
-/data/*.db
-/build/*.exe
+/data/*.db*
+ai-assistant-web/data/*.db*
+*.exe
 /build/bin/*
 frontend/package.json.md5
 /build/us.json
+/build-dev.bat
+/build-prod.bat
+/scripts/upload-release-to-minio.py
+/build-custom.bat
+
+
+*/__pycache__/*

@@ -1,8 +1,10 @@
 package data
 
 import (
-	"github.com/go-resty/resty/v2"
 	"go-stock/backend/logger"
+
+	"github.com/duke-git/lancet/v2/strutil"
+	"github.com/go-resty/resty/v2"
 )
 
 // @Author spark
@@ -16,7 +18,7 @@ type DingDingAPI struct {
 
 func NewDingDingAPI() *DingDingAPI {
 	return &DingDingAPI{
-		client: resty.New(),
+		client: SharedHTTPClient,
 	}
 }
 
@@ -26,7 +28,7 @@ func (DingDingAPI) SendDingDingMessage(message string) string {
 		return "钉钉推送未开启"
 	}
 	// 发送钉钉消息
-	resp, err := resty.New().R().
+	resp, err := SharedHTTPClient.R().
 		SetHeader("Content-Type", "application/json").
 		SetBody(message).
 		Post(getApiURL())
@@ -43,8 +45,16 @@ func getApiURL() string {
 }
 
 func (DingDingAPI) SendToDingDing(title, message string) string {
+	message = strutil.ReplaceWithMap(message, map[string]string{
+		"\\n":   "\n",
+		"\\r":   "\r",
+		"\\t":   "\t",
+		"\\\\n": "\n",
+		"\\\\r": "\r",
+		"\\\\t": "\t",
+	})
 	// 发送钉钉消息
-	resp, err := resty.New().R().
+	resp, err := SharedHTTPClient.R().
 		SetHeader("Content-Type", "application/json").
 		SetBody(&Message{
 			Msgtype: "markdown",
